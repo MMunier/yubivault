@@ -1,0 +1,26 @@
+# Binaries
+/yubivault
+/terraform-provider-yubivault
+
+# Go
+*.test
+*.out
+vendor/
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl
+
+# Vault (DO NOT commit secrets!)
+vault/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
