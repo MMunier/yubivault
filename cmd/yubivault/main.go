@@ -5,8 +5,9 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/go-piv/piv-go/piv"
+	"github.com/go-piv/piv-go/v2/piv"
 	"github.com/mmunier/terraform-provider-yubivault/internal/yubikey"
+	"golang.org/x/term"
 )
 
 func main() {
@@ -113,6 +114,12 @@ func encryptSecret() error {
 	}
 
 	secretName := os.Args[2]
+
+	// Validate secret name to prevent path traversal
+	if err := yubikey.ValidateSecretName(secretName); err != nil {
+		return err
+	}
+
 	vaultPath := os.Getenv("YUBIVAULT_PATH")
 	if vaultPath == "" {
 		vaultPath = "./vault"
@@ -126,7 +133,12 @@ func encryptSecret() error {
 	pin := os.Getenv("YUBIKEY_PIN")
 	if pin == "" {
 		fmt.Print("Enter PIN: ")
-		fmt.Scanln(&pin)
+		pinBytes, err := term.ReadPassword(int(os.Stdin.Fd()))
+		fmt.Println() // newline after hidden input
+		if err != nil {
+			return fmt.Errorf("failed to read PIN: %w", err)
+		}
+		pin = string(pinBytes)
 	}
 
 	// Read secret from stdin
@@ -166,6 +178,12 @@ func decryptSecret() error {
 	}
 
 	secretName := os.Args[2]
+
+	// Validate secret name to prevent path traversal
+	if err := yubikey.ValidateSecretName(secretName); err != nil {
+		return err
+	}
+
 	vaultPath := os.Getenv("YUBIVAULT_PATH")
 	if vaultPath == "" {
 		vaultPath = "./vault"
@@ -179,7 +197,12 @@ func decryptSecret() error {
 	pin := os.Getenv("YUBIKEY_PIN")
 	if pin == "" {
 		fmt.Print("Enter PIN: ")
-		fmt.Scanln(&pin)
+		pinBytes, err := term.ReadPassword(int(os.Stdin.Fd()))
+		fmt.Println() // newline after hidden input
+		if err != nil {
+			return fmt.Errorf("failed to read PIN: %w", err)
+		}
+		pin = string(pinBytes)
 	}
 
 	// Initialize vault

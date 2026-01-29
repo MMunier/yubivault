@@ -6,14 +6,41 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/rsa"
-	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 
-	"github.com/go-piv/piv-go/piv"
+	"github.com/go-piv/piv-go/v2/piv"
 )
+
+// validSecretNamePattern only allows alphanumeric characters, hyphens, and underscores
+// This prevents path traversal attacks
+var validSecretNamePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]*$`)
+
+// zeroBytes securely zeros a byte slice to prevent sensitive data from lingering in memory
+func zeroBytes(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
+}
+
+// ValidateSecretName validates that a secret name is safe to use as a filename.
+// It prevents path traversal attacks by only allowing alphanumeric characters,
+// hyphens, and underscores. The name must start with an alphanumeric character.
+func ValidateSecretName(name string) error {
+	if name == "" {
+		return fmt.Errorf("secret name cannot be empty")
+	}
+	if len(name) > 255 {
+		return fmt.Errorf("secret name too long (max 255 characters)")
+	}
+	if !validSecretNamePattern.MatchString(name) {
+		return fmt.Errorf("invalid secret name: must contain only alphanumeric characters, hyphens, and underscores, and start with an alphanumeric character")
+	}
+	return nil
+}
 
 // Vault manages encrypted secrets using YubiKey PIV as trust anchor
 type Vault struct {
@@ -75,8 +102,14 @@ func NewVault(vaultPath, slotStr, pin string) (*Vault, error) {
 	return vault, nil
 }
 
-// Close closes the YubiKey connection
+// Close closes the YubiKey connection and securely zeros sensitive data
 func (v *Vault) Close() error {
+	// Zero master key to prevent it from lingering in memory
+	if v.masterKey != nil {
+		zeroBytes(v.masterKey)
+		v.masterKey = nil
+	}
+
 	if v.yk != nil {
 		return v.yk.Close()
 	}
@@ -114,9 +147,8 @@ func (v *Vault) decryptWithYubiKey(ciphertext []byte) ([]byte, error) {
 		return nil, fmt.Errorf("private key does not support decryption")
 	}
 
-	plaintext, err := rsaPrivateKey.Decrypt(rand.Reader, ciphertext, &rsa.OAEPOptions{
-		Hash: crypto.SHA256,
-	})
+	// piv-go only supports PKCS#1 v1.5 padding for RSA decryption
+	plaintext, err := rsaPrivateKey.Decrypt(rand.Reader, ciphertext, nil)
 	if err != nil {
 		return nil, fmt.Errorf("decryption failed: %w", err)
 	}
@@ -200,6 +232,8 @@ func (v *Vault) EncryptSecret(plaintext []byte) ([]byte, error) {
 func GenerateMasterKey(vaultPath string, publicKey crypto.PublicKey) error {
 	// Generate 256-bit master key
 	masterKey := make([]byte, 32)
+	defer zeroBytes(masterKey) // Zero master key when done
+
 	if _, err := rand.Read(masterKey); err != nil {
 		return fmt.Errorf("failed to generate master key: %w", err)
 	}
@@ -210,12 +244,11 @@ func GenerateMasterKey(vaultPath string, publicKey crypto.PublicKey) error {
 		return fmt.Errorf("public key is not RSA")
 	}
 
-	encryptedMasterKey, err := rsa.EncryptOAEP(
-		sha256.New(),
+	// Use PKCS#1 v1.5 padding - piv-go only supports this for RSA decryption
+	encryptedMasterKey, err := rsa.EncryptPKCS1v15(
 		rand.Reader,
 		rsaPublicKey,
 		masterKey,
-		nil,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to encrypt master key: %w", err)

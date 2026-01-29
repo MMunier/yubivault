@@ -2,12 +2,14 @@ package provider
 
 import (
 	"context"
+	"sync"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/provider"
 	"github.com/hashicorp/terraform-plugin-framework/provider/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/mmunier/terraform-provider-yubivault/internal/yubikey"
 )
 
 var _ provider.Provider = &YubivaultProvider{}
@@ -94,4 +96,26 @@ type ProviderData struct {
 	VaultPath string
 	PivSlot   string
 	PivPin    string
+
+	mu    sync.Mutex
+	vault *yubikey.Vault
+}
+
+// GetVault returns a shared vault instance, initializing it on first use.
+// This ensures only one YubiKey connection is open at a time.
+func (p *ProviderData) GetVault() (*yubikey.Vault, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.vault != nil {
+		return p.vault, nil
+	}
+
+	vault, err := yubikey.NewVault(p.VaultPath, p.PivSlot, p.PivPin)
+	if err != nil {
+		return nil, err
+	}
+
+	p.vault = vault
+	return p.vault, nil
 }

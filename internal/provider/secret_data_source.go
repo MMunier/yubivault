@@ -74,16 +74,20 @@ func (d *SecretDataSource) Read(ctx context.Context, req datasource.ReadRequest,
 		return
 	}
 
-	tflog.Debug(ctx, "Reading secret", map[string]any{
-		"name": data.Name.ValueString(),
-	})
+	tflog.Debug(ctx, "Reading secret")
 
-	// Initialize YubiKey vault
-	vault, err := yubikey.NewVault(
-		d.providerData.VaultPath,
-		d.providerData.PivSlot,
-		d.providerData.PivPin,
-	)
+	// Validate secret name to prevent path traversal attacks
+	secretName := data.Name.ValueString()
+	if err := yubikey.ValidateSecretName(secretName); err != nil {
+		resp.Diagnostics.AddError(
+			"Invalid secret name",
+			err.Error(),
+		)
+		return
+	}
+
+	// Get shared YubiKey vault instance
+	vault, err := d.providerData.GetVault()
 	if err != nil {
 		resp.Diagnostics.AddError(
 			"Failed to initialize YubiKey vault",
@@ -91,15 +95,14 @@ func (d *SecretDataSource) Read(ctx context.Context, req datasource.ReadRequest,
 		)
 		return
 	}
-	defer vault.Close()
 
 	// Read encrypted secret file
-	secretPath := filepath.Join(d.providerData.VaultPath, "secrets", data.Name.ValueString()+".enc")
+	secretPath := filepath.Join(d.providerData.VaultPath, "secrets", secretName+".enc")
 	ciphertext, err := os.ReadFile(secretPath)
 	if err != nil {
 		resp.Diagnostics.AddError(
 			"Failed to read secret file",
-			fmt.Sprintf("Secret: %s, Error: %s", data.Name.ValueString(), err),
+			"The requested secret could not be found or read",
 		)
 		return
 	}
@@ -109,7 +112,7 @@ func (d *SecretDataSource) Read(ctx context.Context, req datasource.ReadRequest,
 	if err != nil {
 		resp.Diagnostics.AddError(
 			"Failed to decrypt secret",
-			fmt.Sprintf("Secret: %s, Error: %s", data.Name.ValueString(), err),
+			"Decryption failed - verify vault integrity and YubiKey access",
 		)
 		return
 	}

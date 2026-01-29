@@ -7,10 +7,15 @@ terraform {
   }
 }
 
+variable "piv_pin" {
+  sensitive = true
+  type = string
+}
+
 provider "yubivault" {
   vault_path = "./vault"
   piv_slot   = "9d"
-  # piv_pin  = "123456"  # Better to use YUBIKEY_PIN env var
+  piv_pin  = var.piv_pin  # Better to use YUBIKEY_PIN env var
 }
 
 # Read a single secret
@@ -30,7 +35,7 @@ data "yubivault_secret" "tls_cert" {
 # Example usage with other providers
 output "db_password_length" {
   value     = length(data.yubivault_secret.database_password.value)
-  sensitive = false
+  sensitive = true
 }
 
 output "secrets_loaded" {
