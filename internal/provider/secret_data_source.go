@@ -3,14 +3,13 @@ package provider
 import (
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
+	"io"
+	"net/http"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/datasource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-log/tflog"
-	"github.com/mmunier/terraform-provider-yubivault/internal/yubikey"
 )
 
 var _ datasource.DataSource = &SecretDataSource{}
@@ -74,45 +73,45 @@ func (d *SecretDataSource) Read(ctx context.Context, req datasource.ReadRequest,
 		return
 	}
 
-	tflog.Debug(ctx, "Reading secret")
-
-	// Validate secret name to prevent path traversal attacks
 	secretName := data.Name.ValueString()
-	if err := yubikey.ValidateSecretName(secretName); err != nil {
+	tflog.Debug(ctx, "Reading secret from server", map[string]interface{}{
+		"name": secretName,
+	})
+
+	// Fetch secret from yubivault server
+	url := fmt.Sprintf("%s/secret/%s", d.providerData.ServerURL, secretName)
+	httpResp, err := http.Get(url)
+	if err != nil {
 		resp.Diagnostics.AddError(
-			"Invalid secret name",
-			err.Error(),
+			"Failed to connect to yubivault server",
+			fmt.Sprintf("Could not reach server at %s: %s", d.providerData.ServerURL, err),
+		)
+		return
+	}
+	defer httpResp.Body.Close()
+
+	if httpResp.StatusCode == http.StatusNotFound {
+		resp.Diagnostics.AddError(
+			"Secret not found",
+			fmt.Sprintf("Secret '%s' does not exist in the vault", secretName),
 		)
 		return
 	}
 
-	// Get shared YubiKey vault instance
-	vault, err := d.providerData.GetVault()
-	if err != nil {
+	if httpResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(httpResp.Body)
 		resp.Diagnostics.AddError(
-			"Failed to initialize YubiKey vault",
-			fmt.Sprintf("Error: %s", err),
+			"Failed to retrieve secret",
+			fmt.Sprintf("Server returned status %d: %s", httpResp.StatusCode, string(body)),
 		)
 		return
 	}
 
-	// Read encrypted secret file
-	secretPath := filepath.Join(d.providerData.VaultPath, "secrets", secretName+".enc")
-	ciphertext, err := os.ReadFile(secretPath)
+	plaintext, err := io.ReadAll(httpResp.Body)
 	if err != nil {
 		resp.Diagnostics.AddError(
-			"Failed to read secret file",
-			"The requested secret could not be found or read",
-		)
-		return
-	}
-
-	// Decrypt secret
-	plaintext, err := vault.DecryptSecret(ciphertext)
-	if err != nil {
-		resp.Diagnostics.AddError(
-			"Failed to decrypt secret",
-			"Decryption failed - verify vault integrity and YubiKey access",
+			"Failed to read secret response",
+			fmt.Sprintf("Error reading response: %s", err),
 		)
 		return
 	}

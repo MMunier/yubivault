@@ -2,14 +2,12 @@ package provider
 
 import (
 	"context"
-	"sync"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/provider"
 	"github.com/hashicorp/terraform-plugin-framework/provider/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/types"
-	"github.com/mmunier/terraform-provider-yubivault/internal/yubikey"
 )
 
 var _ provider.Provider = &YubivaultProvider{}
@@ -19,9 +17,7 @@ type YubivaultProvider struct {
 }
 
 type YubivaultProviderModel struct {
-	VaultPath types.String `tfsdk:"vault_path"`
-	PivSlot   types.String `tfsdk:"piv_slot"`
-	PivPin    types.String `tfsdk:"piv_pin"`
+	ServerURL types.String `tfsdk:"server_url"`
 }
 
 func New(version string) func() provider.Provider {
@@ -39,20 +35,11 @@ func (p *YubivaultProvider) Metadata(ctx context.Context, req provider.MetadataR
 
 func (p *YubivaultProvider) Schema(ctx context.Context, req provider.SchemaRequest, resp *provider.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		Description: "Terraform provider for secrets encrypted with YubiKey PIV as trust anchor",
+		Description: "Terraform provider for secrets encrypted with YubiKey PIV as trust anchor. Requires yubivault server to be running.",
 		Attributes: map[string]schema.Attribute{
-			"vault_path": schema.StringAttribute{
-				Description: "Path to the vault directory containing encrypted secrets",
+			"server_url": schema.StringAttribute{
+				Description: "URL of yubivault server (e.g., http://localhost:8099)",
 				Required:    true,
-			},
-			"piv_slot": schema.StringAttribute{
-				Description: "PIV slot to use (default: 9d - Key Management)",
-				Optional:    true,
-			},
-			"piv_pin": schema.StringAttribute{
-				Description: "PIV PIN (can also be set via YUBIKEY_PIN environment variable)",
-				Optional:    true,
-				Sensitive:   true,
 			},
 		},
 	}
@@ -68,14 +55,7 @@ func (p *YubivaultProvider) Configure(ctx context.Context, req provider.Configur
 
 	// Create provider data that will be passed to data sources and resources
 	providerData := &ProviderData{
-		VaultPath: config.VaultPath.ValueString(),
-		PivSlot:   config.PivSlot.ValueString(),
-		PivPin:    config.PivPin.ValueString(),
-	}
-
-	// Default to slot 9d if not specified
-	if providerData.PivSlot == "" {
-		providerData.PivSlot = "9d"
+		ServerURL: config.ServerURL.ValueString(),
 	}
 
 	resp.DataSourceData = providerData
@@ -93,29 +73,5 @@ func (p *YubivaultProvider) DataSources(ctx context.Context) []func() datasource
 }
 
 type ProviderData struct {
-	VaultPath string
-	PivSlot   string
-	PivPin    string
-
-	mu    sync.Mutex
-	vault *yubikey.Vault
-}
-
-// GetVault returns a shared vault instance, initializing it on first use.
-// This ensures only one YubiKey connection is open at a time.
-func (p *ProviderData) GetVault() (*yubikey.Vault, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if p.vault != nil {
-		return p.vault, nil
-	}
-
-	vault, err := yubikey.NewVault(p.VaultPath, p.PivSlot, p.PivPin)
-	if err != nil {
-		return nil, err
-	}
-
-	p.vault = vault
-	return p.vault, nil
+	ServerURL string
 }

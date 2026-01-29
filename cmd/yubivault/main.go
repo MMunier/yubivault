@@ -1,11 +1,15 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 
 	"github.com/go-piv/piv-go/v2/piv"
+	"github.com/mmunier/terraform-provider-yubivault/internal/server"
 	"github.com/mmunier/terraform-provider-yubivault/internal/yubikey"
 	"golang.org/x/term"
 )
@@ -34,6 +38,21 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
+	case "serve":
+		if err := serveStateBackend(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+	case "state-decrypt":
+		if err := stateDecrypt(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+	case "state-encrypt":
+		if err := stateEncrypt(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", command)
 		printUsage()
@@ -44,9 +63,12 @@ func main() {
 func printUsage() {
 	fmt.Println("Usage: yubivault <command>")
 	fmt.Println("\nCommands:")
-	fmt.Println("  init              Initialize a new vault")
-	fmt.Println("  encrypt <name>    Encrypt a secret (reads from stdin)")
-	fmt.Println("  decrypt <name>    Decrypt a secret")
+	fmt.Println("  init                   Initialize a new vault")
+	fmt.Println("  encrypt <name>         Encrypt a secret (reads from stdin)")
+	fmt.Println("  decrypt <name>         Decrypt a secret")
+	fmt.Println("  state-encrypt <name>   Encrypt a state file (reads from stdin)")
+	fmt.Println("  state-decrypt <name>   Decrypt a state file")
+	fmt.Println("  serve [addr]           Start HTTP server (default: localhost:8099)")
 }
 
 func initVault() error {
@@ -244,4 +266,194 @@ func parseSlot(s string) (piv.Slot, error) {
 	}
 
 	return slot, nil
+}
+
+func serveStateBackend() error {
+	vaultPath := os.Getenv("YUBIVAULT_PATH")
+	if vaultPath == "" {
+		vaultPath = "./vault"
+	}
+
+	slot := os.Getenv("YUBIVAULT_SLOT")
+	if slot == "" {
+		slot = "9d"
+	}
+
+	pin := os.Getenv("YUBIKEY_PIN")
+	if pin == "" {
+		fmt.Print("Enter PIN: ")
+		pinBytes, err := term.ReadPassword(int(os.Stdin.Fd()))
+		fmt.Println()
+		if err != nil {
+			return fmt.Errorf("failed to read PIN: %w", err)
+		}
+		pin = string(pinBytes)
+	}
+
+	// Default address
+	addr := "localhost:8099"
+	if len(os.Args) >= 3 {
+		addr = os.Args[2]
+	}
+
+	// Initialize vault
+	vault, err := yubikey.NewVault(vaultPath, slot, pin)
+	if err != nil {
+		return err
+	}
+	defer vault.Close()
+
+	// Create server
+	srv, err := server.NewStateServer(vault, vaultPath)
+	if err != nil {
+		return err
+	}
+
+	// Handle shutdown signals
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		<-sigChan
+		fmt.Println("\nShutting down...")
+		srv.Shutdown(ctx)
+	}()
+
+	// Start server
+	if err := srv.Start(addr); err != nil && err.Error() != "http: Server closed" {
+		return err
+	}
+
+	return nil
+}
+
+func stateDecrypt() error {
+	if len(os.Args) < 3 {
+		return fmt.Errorf("usage: yubivault state-decrypt <project-name>")
+	}
+
+	projectName := os.Args[2]
+
+	// Validate project name to prevent path traversal
+	if err := yubikey.ValidateSecretName(projectName); err != nil {
+		return err
+	}
+
+	vaultPath := os.Getenv("YUBIVAULT_PATH")
+	if vaultPath == "" {
+		vaultPath = "./vault"
+	}
+
+	slot := os.Getenv("YUBIVAULT_SLOT")
+	if slot == "" {
+		slot = "9d"
+	}
+
+	pin := os.Getenv("YUBIKEY_PIN")
+	if pin == "" {
+		fmt.Print("Enter PIN: ")
+		pinBytes, err := term.ReadPassword(int(os.Stdin.Fd()))
+		fmt.Println()
+		if err != nil {
+			return fmt.Errorf("failed to read PIN: %w", err)
+		}
+		pin = string(pinBytes)
+	}
+
+	// Initialize vault
+	vault, err := yubikey.NewVault(vaultPath, slot, pin)
+	if err != nil {
+		return err
+	}
+	defer vault.Close()
+
+	// Read encrypted state
+	statePath := filepath.Join(vaultPath, "state", projectName+".tfstate.enc")
+	ciphertext, err := os.ReadFile(statePath)
+	if err != nil {
+		return fmt.Errorf("failed to read state file: %w", err)
+	}
+
+	// Decrypt state
+	plaintext, err := vault.DecryptSecret(ciphertext)
+	if err != nil {
+		return err
+	}
+
+	fmt.Print(string(plaintext))
+
+	return nil
+}
+
+func stateEncrypt() error {
+	if len(os.Args) < 3 {
+		return fmt.Errorf("usage: yubivault state-encrypt <project-name>")
+	}
+
+	projectName := os.Args[2]
+
+	// Validate project name to prevent path traversal
+	if err := yubikey.ValidateSecretName(projectName); err != nil {
+		return err
+	}
+
+	vaultPath := os.Getenv("YUBIVAULT_PATH")
+	if vaultPath == "" {
+		vaultPath = "./vault"
+	}
+
+	slot := os.Getenv("YUBIVAULT_SLOT")
+	if slot == "" {
+		slot = "9d"
+	}
+
+	pin := os.Getenv("YUBIKEY_PIN")
+	if pin == "" {
+		fmt.Print("Enter PIN: ")
+		pinBytes, err := term.ReadPassword(int(os.Stdin.Fd()))
+		fmt.Println()
+		if err != nil {
+			return fmt.Errorf("failed to read PIN: %w", err)
+		}
+		pin = string(pinBytes)
+	}
+
+	// Read state from stdin
+	fmt.Fprintln(os.Stderr, "Reading state from stdin...")
+	plaintext, err := os.ReadFile("/dev/stdin")
+	if err != nil {
+		return fmt.Errorf("failed to read state: %w", err)
+	}
+
+	// Initialize vault
+	vault, err := yubikey.NewVault(vaultPath, slot, pin)
+	if err != nil {
+		return err
+	}
+	defer vault.Close()
+
+	// Encrypt state
+	ciphertext, err := vault.EncryptSecret(plaintext)
+	if err != nil {
+		return err
+	}
+
+	// Ensure state directory exists
+	stateDir := filepath.Join(vaultPath, "state")
+	if err := os.MkdirAll(stateDir, 0700); err != nil {
+		return fmt.Errorf("failed to create state directory: %w", err)
+	}
+
+	// Save encrypted state
+	statePath := filepath.Join(stateDir, projectName+".tfstate.enc")
+	if err := os.WriteFile(statePath, ciphertext, 0600); err != nil {
+		return fmt.Errorf("failed to write state file: %w", err)
+	}
+
+	fmt.Fprintf(os.Stderr, "State encrypted and saved to: %s\n", statePath)
+
+	return nil
 }

@@ -5,17 +5,20 @@ terraform {
       version = "0.1.0"
     }
   }
+
+  # Encrypted state backend using YubiVault
+  # Start the server first: yubivault serve
+  backend "http" {
+    address        = "http://localhost:8099/state/basic"
+    lock_address   = "http://localhost:8099/state/basic"
+    unlock_address = "http://localhost:8099/state/basic"
+  }
 }
 
-variable "piv_pin" {
-  sensitive = true
-  type = string
-}
-
+# Provider connects to yubivault server for secrets
+# Start server first: yubivault serve
 provider "yubivault" {
-  vault_path = "./vault"
-  piv_slot   = "9d"
-  piv_pin  = var.piv_pin  # Better to use YUBIKEY_PIN env var
+  server_url = "http://localhost:8099"
 }
 
 # Read a single secret
