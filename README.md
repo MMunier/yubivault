@@ -96,23 +96,7 @@ cat <<EOF | ./yubivault encrypt api_config
 EOF
 ```
 
-### 3. Start the YubiVault server
-
-The server provides HTTPS endpoints for secret retrieval and Terraform state storage:
-
-```bash
-# Start server (auto-generates self-signed certificate)
-./yubivault serve
-# → Starts on https://localhost:8099
-# → Certificate saved to vault/tls/server.crt
-
-# Or use custom certificate for production
-./yubivault serve --cert /path/to/cert.pem --key /path/to/key.pem
-```
-
-The server authenticates with your YubiKey once at startup, then serves secrets over HTTPS.
-
-### 4. Use in Terraform
+### 3. Use in Terraform
 
 ```hcl
 terraform {
@@ -123,21 +107,12 @@ terraform {
     }
   }
 
-  # Optional: Use YubiVault as Terraform state backend
-  backend "http" {
-    address        = "https://localhost:8099/state/myproject"
-    lock_address   = "https://localhost:8099/state/myproject"
-    unlock_address = "https://localhost:8099/state/myproject"
-  }
+  # Encrypted state backend - configured automatically by yubivault run
+  backend "http" {}
 }
 
-provider "yubivault" {
-  server_url = "https://localhost:8099"
-
-  # TLS configuration (optional):
-  # tls_ca_cert          = "/path/to/ca.crt"  # For custom certificates
-  # insecure_skip_verify = true               # Skip cert verification (dev only)
-}
+# Provider configured automatically via environment variables
+provider "yubivault" {}
 
 data "yubivault_secret" "db_password" {
   name = "db_password"
@@ -149,12 +124,28 @@ resource "postgresql_database" "example" {
 }
 ```
 
-### 5. Run Terraform
+### 4. Run Terraform with YubiVault
+
+Use `yubivault run` to automatically start the server, configure environment variables, and run terraform/tofu:
 
 ```bash
-terraform init
-terraform plan   # Provider fetches secrets from server
-terraform apply
+yubivault run init              # Initialize Terraform
+yubivault run plan              # Plan changes
+yubivault run apply             # Apply changes
+yubivault run apply -auto-approve
+```
+
+The `run` command:
+- Auto-detects `tofu` or `terraform` in PATH (prefers tofu)
+- Starts an HTTPS server on a random port
+- Authenticates with your YubiKey once
+- Configures all TF_HTTP_* and YUBIVAULT_* environment variables
+- Runs the terraform/tofu command
+- Shuts down the server when done
+
+**Project name** defaults to the current directory name. Override with:
+```bash
+yubivault run --project myapp plan
 ```
 
 ## Configuration
@@ -173,31 +164,6 @@ terraform apply
 | `9c` | Signature | Code signing | Not recommended for vault |
 | `9d` | Key Management | Encryption | **Recommended for vault** |
 | `9e` | Card Authentication | Physical access | Not recommended for vault |
-
-## FIDO2 Authentication (Optional)
-
-YubiVault supports optional FIDO2/WebAuthn authentication for multi-user access control. When FIDO2 credentials are registered, the server requires authentication for secret and state access.
-
-### Register FIDO2 Credential
-
-```bash
-# Start server first
-yubivault serve
-
-# In another terminal, register your security key
-yubivault fido2-register https://localhost:8099
-# → Touch your YubiKey to complete registration
-```
-
-Once registered, the Terraform provider will prompt for YubiKey touch during authentication. Sessions are cached for 1 hour.
-
-### Disable FIDO2 Authentication
-
-To remove authentication requirements, delete the credentials file:
-
-```bash
-rm vault/credentials.enc
-```
 
 ## Security Considerations
 
@@ -273,9 +239,9 @@ YubiVault server **always uses HTTPS** to protect secrets in transit. The server
 
 ### Provider TLS Configuration
 
-When using self-signed certificates, the provider automatically trusts certificates from `${YUBIVAULT_PATH}/tls/server.crt` when running on the same machine as the server.
+When using `yubivault run`, TLS is configured automatically via environment variables (`YUBIVAULT_CA_CERT` and `TF_HTTP_CLIENT_CA_CERTIFICATE_PEM`).
 
-For remote servers or custom certificates:
+For standalone server usage or remote servers:
 
 ```hcl
 provider "yubivault" {
@@ -289,7 +255,7 @@ For development/testing only:
 ```hcl
 provider "yubivault" {
   server_url           = "https://localhost:8099"
-  insecure_skip_verify = true  # ⚠️ Disables certificate verification
+  insecure_skip_verify = true  # Disables certificate verification
 }
 ```
 
@@ -305,13 +271,16 @@ echo "secret" | yubivault encrypt my-secret
 # Decrypt secret (prints to stdout)
 yubivault decrypt my-secret
 
-# Start HTTPS server
+# Run terraform/tofu with YubiVault integration (recommended)
+yubivault run init                    # Initialize Terraform
+yubivault run plan                    # Plan changes
+yubivault run apply -auto-approve     # Apply changes
+yubivault run --project myapp plan    # Specify project name
+
+# Start standalone HTTPS server (for advanced use)
 yubivault serve                                          # Auto-generates certificate
 yubivault serve --cert cert.pem --key key.pem          # Custom certificate
 yubivault serve 0.0.0.0:8099                           # Listen on all interfaces
-
-# Register FIDO2 credential for authentication
-yubivault fido2-register https://localhost:8099
 
 # Batch encrypt
 for secret in db_password api_key; do
@@ -360,11 +329,11 @@ go test ./internal/yubikey -v
 
 ## Limitations
 
-- **Single YubiKey dependency**: Vault requires physical YubiKey to start server
+- **Single YubiKey dependency**: Vault requires physical YubiKey access
 - **No secret versioning**: Rotating secrets requires manual re-encryption
-- **Server-based architecture**: Terraform requires running server (not standalone provider)
+- **Server-based architecture**: Uses embedded server (managed automatically by `yubivault run`)
 - **Self-signed certificates**: Auto-generated certificates not trusted by default outside localhost
-- **CI/CD challenges**: Server must run on machine with physical YubiKey access
+- **CI/CD challenges**: Must run on machine with physical YubiKey access
 
 ## License
 
