@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -120,46 +121,57 @@ func NewStateServer(vault *yubikey.Vault, vaultPath, addr string) (*StateServer,
 }
 
 // Start starts the HTTPS server (always uses TLS)
-// Certificate priority: 1) explicit certFile/keyFile, 2) vault/tls/ directory, 3) auto-generate
+// Certificate priority: 1) import explicit certFile/keyFile, 2) vault/tls/ directory, 3) auto-generate
+// All private keys are stored encrypted in vault/tls/server.key.enc
 func (s *StateServer) Start(addr, certFile, keyFile string) error {
-	// Determine certificate paths with priority logic
-	var finalCertFile, finalKeyFile string
+	tlsDir := filepath.Join(s.vaultPath, "tls")
+	vaultCertFile := filepath.Join(tlsDir, "server.crt")
+	vaultKeyFile := filepath.Join(tlsDir, "server.key.enc")
+
+	var cert tls.Certificate
 	var certSource string
 
 	if certFile != "" && keyFile != "" {
-		// Priority 1: Use explicitly provided certificate paths
-		finalCertFile = certFile
-		finalKeyFile = keyFile
-		certSource = "explicit"
-	} else {
-		// Priority 2: Check for certificates in vault/tls/ directory
-		tlsDir := filepath.Join(s.vaultPath, "tls")
-		defaultCertFile := filepath.Join(tlsDir, "server.crt")
-		defaultKeyFile := filepath.Join(tlsDir, "server.key")
+		// Priority 1: Import explicitly provided certificates into vault
+		log.Printf("Importing TLS certificates from %s and %s", certFile, keyFile)
+		if err := ImportTLSCert(certFile, keyFile, vaultCertFile, vaultKeyFile, s.vault); err != nil {
+			return fmt.Errorf("failed to import TLS certificates: %w", err)
+		}
+		certSource = "imported"
+		log.Printf("TLS certificates imported to %s", tlsDir)
+	}
 
-		if _, err := os.Stat(defaultCertFile); err == nil {
-			if _, err := os.Stat(defaultKeyFile); err == nil {
-				// Use existing certificates from vault/tls/
-				finalCertFile = defaultCertFile
-				finalKeyFile = defaultKeyFile
+	// Check if encrypted certificates exist in vault
+	if _, err := os.Stat(vaultCertFile); err == nil {
+		if _, err := os.Stat(vaultKeyFile); err == nil {
+			// Load existing encrypted certificates
+			var loadErr error
+			cert, loadErr = LoadTLSKeyPair(vaultCertFile, vaultKeyFile, s.vault)
+			if loadErr != nil {
+				return fmt.Errorf("failed to load TLS certificates: %w", loadErr)
+			}
+			if certSource == "" {
 				certSource = "vault"
 			}
 		}
+	}
 
-		// Priority 3: Auto-generate if no certificates found
-		if finalCertFile == "" {
-			if err := GenerateSelfSignedCert(defaultCertFile, defaultKeyFile); err != nil {
-				return fmt.Errorf("failed to generate self-signed certificate: %w", err)
-			}
-			finalCertFile = defaultCertFile
-			finalKeyFile = defaultKeyFile
-			certSource = "auto-generated"
-			log.Printf("Generated new self-signed certificate in %s", tlsDir)
+	// Auto-generate if no certificates found
+	if certSource == "" {
+		log.Printf("Generating new self-signed certificate in %s", tlsDir)
+		if err := GenerateSelfSignedCert(vaultCertFile, vaultKeyFile, s.vault); err != nil {
+			return fmt.Errorf("failed to generate self-signed certificate: %w", err)
 		}
+		var loadErr error
+		cert, loadErr = LoadTLSKeyPair(vaultCertFile, vaultKeyFile, s.vault)
+		if loadErr != nil {
+			return fmt.Errorf("failed to load generated TLS certificates: %w", loadErr)
+		}
+		certSource = "auto-generated"
 	}
 
 	// Get certificate fingerprint for logging
-	fingerprint, err := GetCertFingerprint(finalCertFile)
+	fingerprint, err := GetCertFingerprint(vaultCertFile)
 	if err != nil {
 		log.Printf("Warning: failed to get certificate fingerprint: %v", err)
 		fingerprint = "unknown"
@@ -177,9 +189,16 @@ func (s *StateServer) Start(addr, certFile, keyFile string) error {
 	mux.HandleFunc("/state/", s.authMw.RequireAuth(s.handleState))
 	mux.HandleFunc("/secret/", s.authMw.RequireAuth(s.handleSecret))
 
+	// Configure TLS with in-memory certificate (private key never on disk unencrypted)
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}
+
 	s.server = &http.Server{
 		Addr:         addr,
 		Handler:      s.logMiddleware(mux),
+		TLSConfig:    tlsConfig,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
 	}
@@ -187,9 +206,10 @@ func (s *StateServer) Start(addr, certFile, keyFile string) error {
 	log.Printf("Starting YubiVault server on %s", addr)
 	log.Printf("Vault path: %s", s.vaultPath)
 	log.Printf("TLS: ENABLED (HTTPS only)")
-	log.Printf("  Certificate: %s (%s)", finalCertFile, certSource)
+	log.Printf("  Certificate: %s (%s)", vaultCertFile, certSource)
+	log.Printf("  Private key: encrypted at %s", vaultKeyFile)
 	log.Printf("  Fingerprint: %s", fingerprint)
-	if certSource == "auto-generated" || certSource == "vault" {
+	if certSource == "auto-generated" {
 		log.Printf("  Note: Self-signed certificate - clients must trust manually or use insecure_skip_verify")
 	}
 	if s.credentials.HasCredentials() {
@@ -221,8 +241,8 @@ func (s *StateServer) Start(addr, certFile, keyFile string) error {
 	s.cleanupCancel = cleanupCancel
 	s.startCleanupRoutine(cleanupCtx)
 
-	// Always use HTTPS
-	return s.server.ListenAndServeTLS(finalCertFile, finalKeyFile)
+	// Start HTTPS server (cert/key already loaded in TLSConfig)
+	return s.server.ListenAndServeTLS("", "")
 }
 
 // Shutdown gracefully shuts down the server
