@@ -54,7 +54,7 @@ type Vault struct {
 // NewVault initializes a vault with YubiKey PIV
 func NewVault(vaultPath, slotStr, pin string) (*Vault, error) {
 	// Parse PIV slot
-	slot, err := parseSlot(slotStr)
+	slot, err := ParseSlot(slotStr)
 	if err != nil {
 		return nil, fmt.Errorf("invalid PIV slot: %w", err)
 	}
@@ -263,7 +263,8 @@ func GenerateMasterKey(vaultPath string, publicKey crypto.PublicKey) error {
 	return nil
 }
 
-func parseSlot(s string) (piv.Slot, error) {
+// ParseSlot converts a slot string (9a, 9c, 9d, 9e) to a piv.Slot
+func ParseSlot(s string) (piv.Slot, error) {
 	slots := map[string]piv.Slot{
 		"9a": piv.SlotAuthentication,
 		"9c": piv.SlotSignature,

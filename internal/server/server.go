@@ -509,44 +509,31 @@ func (s *StateServer) handleRegisterComplete(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Read and log the raw body for debugging
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
 		log.Printf("Error reading request body: %v", err)
 		http.Error(w, "failed to read request", http.StatusBadRequest)
 		return
 	}
-	log.Printf("Registration request body (%d bytes): %s", len(bodyBytes), string(bodyBytes))
 
 	// Parse the credential creation response from bytes
 	parsedResponse, err := protocol.ParseCredentialCreationResponseBody(bytes.NewReader(bodyBytes))
 	if err != nil {
 		log.Printf("Error parsing registration response: %v", err)
-		// Try to get more details from the error
-		if pErr, ok := err.(*protocol.Error); ok {
-			log.Printf("  Protocol error type: %s", pErr.Type)
-			log.Printf("  Protocol error details: %s", pErr.Details)
-			log.Printf("  Protocol error info: %s", pErr.DevInfo)
-		}
 		http.Error(w, fmt.Sprintf("invalid registration response: %v", err), http.StatusBadRequest)
 		return
 	}
 
 	// Find session data by challenge - already decoded by webauthn library
 	challenge, err := base64.RawURLEncoding.DecodeString(parsedResponse.Response.CollectedClientData.Challenge)
-	challengeKey := string(challenge)
 	if err != nil {
-		log.Panicf("Failed to decode challenge token!")
+		log.Printf("Failed to decode challenge token: %v", err)
 		http.Error(w, fmt.Sprintf("invalid challenge token: %v", err), http.StatusBadRequest)
 		return
 	}
+	challengeKey := string(challenge)
 
 	s.challengeMu.RLock()
-	log.Printf("Looking for challenge (base64): %s", base64.RawURLEncoding.EncodeToString([]byte(challengeKey)))
-	log.Printf("Stored challenges:")
-	for k := range s.challenges {
-		log.Printf("  - (base64): %s", base64.RawURLEncoding.EncodeToString([]byte(k)))
-	}
 	sessionData, exists := s.challenges[challengeKey]
 	s.challengeMu.RUnlock()
 

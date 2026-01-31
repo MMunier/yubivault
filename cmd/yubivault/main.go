@@ -121,7 +121,7 @@ func initVault() error {
 	defer yk.Close()
 
 	// Get public key from certificate
-	pivSlot, err := parseSlot(slot)
+	pivSlot, err := yubikey.ParseSlot(slot)
 	if err != nil {
 		return err
 	}
@@ -265,22 +265,6 @@ func decryptSecret() error {
 	fmt.Print(string(plaintext))
 
 	return nil
-}
-
-func parseSlot(s string) (piv.Slot, error) {
-	slots := map[string]piv.Slot{
-		"9a": piv.SlotAuthentication,
-		"9c": piv.SlotSignature,
-		"9d": piv.SlotKeyManagement,
-		"9e": piv.SlotCardAuthentication,
-	}
-
-	slot, ok := slots[s]
-	if !ok {
-		return piv.Slot{}, fmt.Errorf("unknown slot: %s (valid: 9a, 9c, 9d, 9e)", s)
-	}
-
-	return slot, nil
 }
 
 func serveStateBackend() error {
@@ -541,7 +525,6 @@ func fido2Register() error {
 		"origin":      origin,
 		"crossOrigin": false,
 	}
-	// OK but base64??: fmt.Printf("Challenge: %v\n", options.Response.Challenge)
 	clientDataJSON, err := json.Marshal(clientData)
 	if err != nil {
 		return fmt.Errorf("failed to create client data: %w", err)
@@ -591,12 +574,6 @@ func fido2Register() error {
 		return fmt.Errorf("failed to build attestation object: %w", err)
 	}
 
-	fmt.Printf("  AuthData length: %d bytes\n", len(attestation.AuthData))
-	fmt.Printf("  CredentialID length: %d bytes\n", len(attestation.CredentialID))
-	fmt.Printf("  PubKey length: %d bytes\n", len(attestation.PubKey))
-	fmt.Printf("  Format: %s\n", attestation.Format)
-
-	fmt.Printf("  clientDataJSON: %v\n", string(clientDataJSON))
 	// Step 6: Send to server - use RawURLEncoding (no padding) as per WebAuthn spec
 	payload := map[string]interface{}{
 		"id":    base64.RawURLEncoding.EncodeToString(attestation.CredentialID),
@@ -629,7 +606,9 @@ func fido2Register() error {
 	}
 
 	var result map[string]interface{}
-	json.NewDecoder(resp.Body).Decode(&result)
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("failed to parse registration response: %w", err)
+	}
 
 	fmt.Println("\n✓ FIDO2 credential registered successfully!")
 	if name, ok := result["name"].(string); ok {
@@ -654,11 +633,6 @@ func buildAttestationObject(att *libfido2.Attestation) ([]byte, error) {
 	if len(authData) < 37 {
 		return nil, fmt.Errorf("authData too short: %d bytes", len(authData))
 	}
-
-	flags := authData[32]
-	fmt.Printf("  AuthData length: %d bytes (decoded from %d)\n", len(authData), len(att.AuthData))
-	fmt.Printf("  AuthData flags: 0x%02x (AT=%v, UP=%v, UV=%v)\n",
-		flags, flags&0x40 != 0, flags&0x01 != 0, flags&0x04 != 0)
 
 	// Build attestation statement based on format
 	attStmt := buildAttestationStatement(att)
