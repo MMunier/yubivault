@@ -21,6 +21,12 @@ import (
 // TLSKeyAAD is the Additional Authenticated Data used for TLS private key encryption
 const TLSKeyAAD = "tls:server-key"
 
+// Encrypter interface for encrypting/decrypting data (implemented by yubikey.Vault)
+type Encrypter interface {
+	EncryptSecret(plaintext []byte, name string) ([]byte, error)
+	DecryptSecret(ciphertext []byte, name string) ([]byte, error)
+}
+
 // GenerateSelfSignedCert creates a new self-signed certificate and private key.
 // The certificate is written to certPath unencrypted (it's public).
 // The private key is encrypted using the provided encrypter and written to keyPath.

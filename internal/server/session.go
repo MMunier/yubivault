@@ -100,3 +100,27 @@ func (s *SessionStore) Cleanup() {
 		}
 	}
 }
+
+// CreatePresharedToken generates a session token that never expires.
+// Used by the `run` command to create a token for the subprocess.
+func (s *SessionStore) CreatePresharedToken() (string, error) {
+	tokenBytes := make([]byte, SessionTokenLength)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		return "", err
+	}
+
+	token := base64.URLEncoding.EncodeToString(tokenBytes)
+	now := time.Now()
+	session := &Session{
+		Token:        token,
+		CreatedAt:    now,
+		ExpiresAt:    now.Add(100 * 365 * 24 * time.Hour), // Effectively never expires
+		CredentialID: nil,                                 // No credential association
+	}
+
+	s.mu.Lock()
+	s.sessions[token] = session
+	s.mu.Unlock()
+
+	return token, nil
+}

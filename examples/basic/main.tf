@@ -7,18 +7,26 @@ terraform {
   }
 
   # Encrypted state backend using YubiVault
-  # Start the server first: yubivault serve
+  # Run with: yubivault run plan
+  #
+  # The yubivault run command automatically:
+  # - Starts the HTTPS server on a random port
+  # - Sets TF_HTTP_* environment variables for the backend
+  # - Authenticates with your YubiKey once
+  # - Runs terraform/tofu with proper credentials
+  # - Shuts down the server when done
+  #
+  # Project name defaults to current directory name (basic)
+  # Override with: yubivault run --project myproject plan
   backend "http" {
-    address        = "http://localhost:8099/state/basic"
-    lock_address   = "http://localhost:8099/state/basic"
-    unlock_address = "http://localhost:8099/state/basic"
+    # Configuration provided via environment variables by yubivault run
   }
 }
 
 # Provider connects to yubivault server for secrets
-# Start server first: yubivault serve
+# Configuration is automatic when using: yubivault run plan
 provider "yubivault" {
-  server_url = "http://localhost:8099"
+  # server_url provided via YUBIVAULT_SERVER_URL by yubivault run
 }
 
 # Read a single secret
@@ -51,3 +59,10 @@ output "secrets_loaded" {
 # resource "aws_db_instance" "example" {
 #   password = data.yubivault_secret.database_password.value
 # }
+#
+# Usage:
+#   1. Initialize vault:     yubivault init
+#   2. Store secrets:        echo "mypassword" | yubivault encrypt db_password
+#   3. Initialize terraform: yubivault run init
+#   4. Plan changes:         yubivault run plan
+#   5. Apply changes:        yubivault run apply

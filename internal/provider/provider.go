@@ -46,14 +46,14 @@ func (p *YubivaultProvider) Metadata(ctx context.Context, req provider.MetadataR
 
 func (p *YubivaultProvider) Schema(ctx context.Context, req provider.SchemaRequest, resp *provider.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		Description: "Terraform provider for secrets encrypted with YubiKey PIV as trust anchor. Requires yubivault server to be running.",
+		Description: "Terraform provider for secrets encrypted with YubiKey PIV as trust anchor. Requires yubivault server to be running. When used with 'yubivault run', configuration is automatic via environment variables.",
 		Attributes: map[string]schema.Attribute{
 			"server_url": schema.StringAttribute{
-				Description: "URL of yubivault server (e.g., https://localhost:8099). Always use https:// as the server only supports TLS.",
-				Required:    true,
+				Description: "URL of yubivault server (e.g., https://localhost:8099). Can also be set via YUBIVAULT_SERVER_URL environment variable.",
+				Optional:    true,
 			},
 			"tls_ca_cert": schema.StringAttribute{
-				Description: "Path to CA certificate file for verifying the server's certificate. If not set, the provider will automatically try to load the certificate from ${YUBIVAULT_PATH}/tls/server.crt (useful when provider and server share the same vault directory).",
+				Description: "Path to CA certificate file for verifying the server's certificate. Can also be set via YUBIVAULT_CA_CERT environment variable.",
 				Optional:    true,
 			},
 			"insecure_skip_verify": schema.BoolAttribute{
@@ -72,11 +72,40 @@ func (p *YubivaultProvider) Configure(ctx context.Context, req provider.Configur
 		return
 	}
 
+	// Determine server URL: config takes precedence over env var
+	serverURL := config.ServerURL.ValueString()
+	if serverURL == "" {
+		serverURL = os.Getenv("YUBIVAULT_SERVER_URL")
+	}
+	if serverURL == "" {
+		resp.Diagnostics.AddError(
+			"Missing Server URL",
+			"server_url must be set in provider configuration or YUBIVAULT_SERVER_URL environment variable",
+		)
+		return
+	}
+
+	// Determine TLS CA cert: config takes precedence over env var
+	tlsCACert := config.TLSCACert.ValueString()
+	if tlsCACert == "" {
+		tlsCACert = os.Getenv("YUBIVAULT_CA_CERT")
+	}
+
+	// Check for pre-shared token from yubivault run
+	token := os.Getenv("YUBIVAULT_TOKEN")
+
 	// Create provider data that will be passed to data sources and resources
 	providerData := &ProviderData{
-		ServerURL:          config.ServerURL.ValueString(),
-		TLSCACert:          config.TLSCACert.ValueString(),
+		ServerURL:          serverURL,
+		TLSCACert:          tlsCACert,
 		InsecureSkipVerify: config.InsecureSkipVerify.ValueBool(),
+		sessionToken:       token,
+	}
+
+	// If we have a pre-shared token, it never expires (subprocess lifetime)
+	if token != "" {
+		providerData.tokenExpiry = time.Now().Add(100 * 365 * 24 * time.Hour)
+		tflog.Info(ctx, "Using pre-shared token from YUBIVAULT_TOKEN environment variable")
 	}
 
 	// Warn if insecure mode is enabled
@@ -105,12 +134,12 @@ type ProviderData struct {
 
 	// Authentication state
 	mu           sync.Mutex
-	fido2Client  *FIDO2Client
 	sessionToken string
 	tokenExpiry  time.Time
 }
 
-// GetAuthToken returns a valid session token, authenticating if necessary
+// GetAuthToken returns a valid session token
+// When running via 'yubivault run', the token is provided via YUBIVAULT_TOKEN env var
 func (p *ProviderData) GetAuthToken(ctx context.Context) (string, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -120,33 +149,8 @@ func (p *ProviderData) GetAuthToken(ctx context.Context) (string, error) {
 		return p.sessionToken, nil
 	}
 
-	// Initialize FIDO2 client if needed
-	if p.fido2Client == nil {
-		p.fido2Client = NewFIDO2Client(p)
-	}
-
-	tflog.Info(ctx, "Authenticating with FIDO2 - touch your YubiKey")
-	fmt.Println("\n[yubivault] Touch your YubiKey to authenticate...")
-
-	// Authenticate
-	token, expiry, err := p.fido2Client.Authenticate()
-	if err != nil {
-		return "", fmt.Errorf("FIDO2 authentication failed: %w", err)
-	}
-
-	// Empty token means auth not required (no credentials registered)
-	if token == "" {
-		return "", nil
-	}
-
-	p.sessionToken = token
-	p.tokenExpiry = expiry
-
-	tflog.Info(ctx, "Authentication successful", map[string]interface{}{
-		"expires_at": expiry.Format(time.RFC3339),
-	})
-
-	return token, nil
+	// No valid token available - when using 'yubivault run', token should always be present
+	return "", nil
 }
 
 // ClearToken clears the cached session token (used on auth failure)
