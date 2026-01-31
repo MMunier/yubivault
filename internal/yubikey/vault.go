@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 
 	"github.com/go-piv/piv-go/v2/piv"
 )
@@ -42,6 +43,105 @@ func ValidateSecretName(name string) error {
 	return nil
 }
 
+// ValidateVaultPath validates and resolves a vault path, checking for symlink attacks.
+// It returns the resolved absolute path or an error if the path is unsafe.
+func ValidateVaultPath(path string) (string, error) {
+	if path == "" {
+		return "", fmt.Errorf("vault path cannot be empty")
+	}
+
+	// Convert to absolute path
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve absolute path: %w", err)
+	}
+
+	// Check if path exists
+	info, err := os.Lstat(absPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Path doesn't exist yet, check parent directory
+			parentDir := filepath.Dir(absPath)
+			parentInfo, parentErr := os.Lstat(parentDir)
+			if parentErr != nil {
+				return "", fmt.Errorf("parent directory does not exist: %w", parentErr)
+			}
+			// Check if parent is a symlink
+			if parentInfo.Mode()&os.ModeSymlink != 0 {
+				return "", fmt.Errorf("parent directory is a symlink, which could be a security risk")
+			}
+			return absPath, nil
+		}
+		return "", fmt.Errorf("failed to stat path: %w", err)
+	}
+
+	// Check if the path itself is a symlink
+	if info.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("vault path is a symlink, which could be a security risk")
+	}
+
+	// If path exists, ensure it's a directory
+	if !info.IsDir() {
+		return "", fmt.Errorf("vault path exists but is not a directory")
+	}
+
+	// Resolve any symlinks in the path components and compare
+	resolvedPath, err := filepath.EvalSymlinks(absPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve symlinks: %w", err)
+	}
+
+	// Warn if resolved path differs (indicates symlinks in parent directories)
+	if resolvedPath != absPath {
+		return "", fmt.Errorf("vault path contains symlinks in parent directories (resolved to %s)", resolvedPath)
+	}
+
+	return absPath, nil
+}
+
+// CheckVaultPermissions verifies that the vault directory has secure permissions.
+// It checks that the directory is not world-readable or writable.
+func CheckVaultPermissions(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // Will be created with correct permissions
+		}
+		return fmt.Errorf("failed to stat vault path: %w", err)
+	}
+
+	mode := info.Mode().Perm()
+
+	// Check for overly permissive permissions (world or group readable/writable)
+	if mode&0077 != 0 {
+		return fmt.Errorf("vault directory has insecure permissions %04o (should be 0700)", mode)
+	}
+
+	return nil
+}
+
+// ResolveVaultPath validates the vault path and optionally checks permissions.
+// This is a convenience function that combines path validation and permission checks.
+func ResolveVaultPath(path string, checkPerms bool) (string, error) {
+	// Check for path traversal attempts
+	if strings.Contains(path, "..") {
+		return "", fmt.Errorf("vault path cannot contain '..'")
+	}
+
+	resolvedPath, err := ValidateVaultPath(path)
+	if err != nil {
+		return "", err
+	}
+
+	if checkPerms {
+		if err := CheckVaultPermissions(resolvedPath); err != nil {
+			return "", err
+		}
+	}
+
+	return resolvedPath, nil
+}
+
 // Vault manages encrypted secrets using YubiKey PIV as trust anchor
 type Vault struct {
 	vaultPath  string
@@ -53,6 +153,13 @@ type Vault struct {
 
 // NewVault initializes a vault with YubiKey PIV
 func NewVault(vaultPath, slotStr, pin string) (*Vault, error) {
+	// Validate and resolve vault path
+	resolvedPath, err := ResolveVaultPath(vaultPath, true)
+	if err != nil {
+		return nil, fmt.Errorf("invalid vault path: %w", err)
+	}
+	vaultPath = resolvedPath
+
 	// Parse PIV slot
 	slot, err := ParseSlot(slotStr)
 	if err != nil {
@@ -263,8 +370,14 @@ func GenerateMasterKey(vaultPath string, publicKey crypto.PublicKey) error {
 	return nil
 }
 
-// ParseSlot converts a slot string (9a, 9c, 9d, 9e) to a piv.Slot
+// ParseSlot converts a slot string (9a, 9c, 9d, 9e) to a piv.Slot.
+// The slot string is case-insensitive and whitespace is trimmed.
+// Note: Slot 9d (Key Management) is recommended for vault encryption.
+// Slot 9a (Authentication) is not recommended as it's typically used for PIV authentication.
 func ParseSlot(s string) (piv.Slot, error) {
+	// Normalize input: trim whitespace and convert to lowercase
+	s = strings.TrimSpace(strings.ToLower(s))
+
 	slots := map[string]piv.Slot{
 		"9a": piv.SlotAuthentication,
 		"9c": piv.SlotSignature,
@@ -275,6 +388,12 @@ func ParseSlot(s string) (piv.Slot, error) {
 	slot, ok := slots[s]
 	if !ok {
 		return piv.Slot{}, fmt.Errorf("unknown slot: %s (valid: 9a, 9c, 9d, 9e)", s)
+	}
+
+	// Warn about non-recommended slots
+	if s == "9a" {
+		fmt.Println("Warning: Slot 9a (Authentication) is not recommended for vault encryption.")
+		fmt.Println("         Consider using slot 9d (Key Management) instead.")
 	}
 
 	return slot, nil

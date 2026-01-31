@@ -6,10 +6,17 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/go-webauthn/webauthn/webauthn"
 )
+
+// Encrypter provides encryption/decryption for credential storage
+type Encrypter interface {
+	EncryptSecret(plaintext []byte) ([]byte, error)
+	DecryptSecret(ciphertext []byte) ([]byte, error)
+}
 
 // FIDO2Credential represents a registered FIDO2 credential
 type FIDO2Credential struct {
@@ -30,20 +37,26 @@ type FIDO2Store struct {
 
 // CredentialStore manages FIDO2 credentials on disk
 type CredentialStore struct {
-	path  string
-	store *FIDO2Store
+	path      string
+	store     *FIDO2Store
+	encrypter Encrypter
 }
 
 // NewCredentialStore creates or loads a credential store
-func NewCredentialStore(vaultPath string) (*CredentialStore, error) {
+// If an encrypter is provided, credentials are stored encrypted
+func NewCredentialStore(vaultPath string, encrypter Encrypter) (*CredentialStore, error) {
 	fido2Dir := filepath.Join(vaultPath, "fido2")
 	if err := os.MkdirAll(fido2Dir, 0700); err != nil {
 		return nil, fmt.Errorf("failed to create fido2 directory: %w", err)
 	}
 
+	// Use .enc extension for encrypted credentials
 	credPath := filepath.Join(fido2Dir, "credentials.json")
+	encCredPath := filepath.Join(fido2Dir, "credentials.enc")
+
 	cs := &CredentialStore{
-		path: credPath,
+		path:      encCredPath,
+		encrypter: encrypter,
 		store: &FIDO2Store{
 			Version:      1,
 			RelyingParty: "yubivault",
@@ -51,10 +64,37 @@ func NewCredentialStore(vaultPath string) (*CredentialStore, error) {
 		},
 	}
 
-	// Load existing credentials if present
+	// Try to load encrypted credentials first
+	if encrypter != nil {
+		if data, err := os.ReadFile(encCredPath); err == nil {
+			plaintext, err := encrypter.DecryptSecret(data)
+			if err != nil {
+				return nil, fmt.Errorf("failed to decrypt credentials: %w", err)
+			}
+			if err := json.Unmarshal(plaintext, cs.store); err != nil {
+				return nil, fmt.Errorf("failed to parse credentials: %w", err)
+			}
+			return cs, nil
+		}
+	}
+
+	// Fall back to plaintext credentials (migration path)
 	if data, err := os.ReadFile(credPath); err == nil {
 		if err := json.Unmarshal(data, cs.store); err != nil {
 			return nil, fmt.Errorf("failed to parse credentials: %w", err)
+		}
+		// If we have an encrypter, migrate to encrypted storage
+		if encrypter != nil && len(cs.store.Credentials) > 0 {
+			if err := cs.save(); err != nil {
+				return nil, fmt.Errorf("failed to migrate credentials to encrypted storage: %w", err)
+			}
+			// Remove plaintext file after successful migration
+			if err := os.Remove(credPath); err != nil && !os.IsNotExist(err) {
+				// Log warning but don't fail
+				fmt.Printf("Warning: failed to remove plaintext credentials file: %v\n", err)
+			} else if err == nil {
+				fmt.Println("Migrated credentials to encrypted storage")
+			}
 		}
 	}
 
@@ -99,11 +139,22 @@ func (cs *CredentialStore) FindCredential(credID []byte) *FIDO2Credential {
 }
 
 func (cs *CredentialStore) save() error {
-	data, err := json.MarshalIndent(cs.store, "", "  ")
+	data, err := json.Marshal(cs.store)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(cs.path, data, 0600)
+
+	// Encrypt if encrypter is available
+	if cs.encrypter != nil {
+		encrypted, err := cs.encrypter.EncryptSecret(data)
+		if err != nil {
+			return fmt.Errorf("failed to encrypt credentials: %w", err)
+		}
+		return os.WriteFile(cs.path, encrypted, 0600)
+	}
+
+	// Fall back to plaintext (should not happen in production)
+	return os.WriteFile(strings.TrimSuffix(cs.path, ".enc")+".json", data, 0600)
 }
 
 // VaultUser implements webauthn.User for the yubivault single-user system

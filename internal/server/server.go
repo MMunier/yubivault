@@ -97,8 +97,8 @@ func NewStateServer(vault *yubikey.Vault, vaultPath, addr string) (*StateServer,
 		return nil, fmt.Errorf("failed to create webauthn: %w", err)
 	}
 
-	// Initialize credential store
-	credentials, err := NewCredentialStore(vaultPath)
+	// Initialize credential store with encryption
+	credentials, err := NewCredentialStore(vaultPath, vault)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create credential store: %w", err)
 	}
