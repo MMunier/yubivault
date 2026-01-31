@@ -1,7 +1,9 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,6 +15,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-webauthn/webauthn/protocol"
+	"github.com/go-webauthn/webauthn/webauthn"
 	"github.com/mmunier/terraform-provider-yubivault/internal/yubikey"
 )
 
@@ -26,6 +30,14 @@ type StateServer struct {
 	locks      map[string]*StateLock
 	lockMu     sync.RWMutex
 	server     *http.Server
+
+	// FIDO2/WebAuthn authentication
+	webauthn    *webauthn.WebAuthn
+	sessions    *SessionStore
+	credentials *CredentialStore
+	authMw      *AuthMiddleware
+	challenges  map[string]*webauthn.SessionData
+	challengeMu sync.RWMutex
 }
 
 // StateLock represents a lock on a state file
@@ -49,12 +61,36 @@ func NewStateServer(vault *yubikey.Vault, vaultPath string) (*StateServer, error
 		return nil, fmt.Errorf("failed to create state directory: %w", err)
 	}
 
+	// Initialize WebAuthn
+	wconfig := &webauthn.Config{
+		RPDisplayName: "YubiVault",
+		RPID:          "localhost",
+		RPOrigins:     []string{"http://localhost:8099"},
+	}
+	webauthnInstance, err := webauthn.New(wconfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create webauthn: %w", err)
+	}
+
+	// Initialize credential store
+	credentials, err := NewCredentialStore(vaultPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create credential store: %w", err)
+	}
+
+	sessions := NewSessionStore()
+
 	return &StateServer{
-		vault:      vault,
-		vaultPath:  vaultPath,
-		stateDir:   stateDir,
-		secretsDir: secretsDir,
-		locks:      make(map[string]*StateLock),
+		vault:       vault,
+		vaultPath:   vaultPath,
+		stateDir:    stateDir,
+		secretsDir:  secretsDir,
+		locks:       make(map[string]*StateLock),
+		webauthn:    webauthnInstance,
+		sessions:    sessions,
+		credentials: credentials,
+		authMw:      NewAuthMiddleware(sessions, credentials),
+		challenges:  make(map[string]*webauthn.SessionData),
 	}, nil
 }
 
@@ -62,11 +98,15 @@ func NewStateServer(vault *yubikey.Vault, vaultPath string) (*StateServer, error
 func (s *StateServer) Start(addr string) error {
 	mux := http.NewServeMux()
 
-	// State endpoints
-	mux.HandleFunc("/state/", s.handleState)
+	// Auth endpoints (no authentication required)
+	mux.HandleFunc("/auth/challenge", s.handleAuthChallenge)
+	mux.HandleFunc("/auth/verify", s.handleAuthVerify)
+	mux.HandleFunc("/auth/register/begin", s.handleRegisterBegin)
+	mux.HandleFunc("/auth/register/complete", s.handleRegisterComplete)
 
-	// Secret endpoints
-	mux.HandleFunc("/secret/", s.handleSecret)
+	// Protected endpoints (auth required when credentials exist)
+	mux.HandleFunc("/state/", s.authMw.RequireAuth(s.handleState))
+	mux.HandleFunc("/secret/", s.authMw.RequireAuth(s.handleSecret))
 
 	s.server = &http.Server{
 		Addr:         addr,
@@ -77,9 +117,17 @@ func (s *StateServer) Start(addr string) error {
 
 	log.Printf("Starting YubiVault server on %s", addr)
 	log.Printf("Vault path: %s", s.vaultPath)
+	if s.credentials.HasCredentials() {
+		log.Printf("FIDO2 authentication: ENABLED")
+	} else {
+		log.Printf("FIDO2 authentication: DISABLED (no credentials registered)")
+		log.Printf("  Run 'yubivault fido2-register' to enable authentication")
+	}
 	log.Printf("\nEndpoints:")
-	log.Printf("  GET  /secret/{name}  - Retrieve decrypted secret")
+	log.Printf("  GET  /secret/{name}   - Retrieve decrypted secret")
 	log.Printf("  *    /state/{project} - Terraform state backend")
+	log.Printf("  GET  /auth/challenge  - Get FIDO2 authentication challenge")
+	log.Printf("  POST /auth/verify     - Verify FIDO2 assertion")
 	log.Printf("\nConfigure Terraform provider with:")
 	log.Printf("  provider \"yubivault\" {")
 	log.Printf("    server_url = \"http://%s\"", addr)
@@ -317,4 +365,230 @@ func (s *StateServer) handleSecret(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/plain")
 	w.Write(plaintext)
+}
+
+// handleAuthChallenge returns a WebAuthn challenge for authentication
+func (s *StateServer) handleAuthChallenge(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if !s.credentials.HasCredentials() {
+		http.Error(w, "no credentials registered - run 'yubivault fido2-register' first", http.StatusPreconditionFailed)
+		return
+	}
+
+	user := NewVaultUser(s.credentials)
+	options, sessionData, err := s.webauthn.BeginLogin(user)
+	if err != nil {
+		log.Printf("Error creating challenge: %v", err)
+		http.Error(w, fmt.Sprintf("failed to create challenge: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Store session data keyed by challenge - use raw bytes as key
+	challengeKey := string(options.Response.Challenge)
+	s.challengeMu.Lock()
+	s.challenges[challengeKey] = sessionData
+	s.challengeMu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(options)
+}
+
+// handleAuthVerify verifies a WebAuthn assertion and returns a session token
+func (s *StateServer) handleAuthVerify(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse the credential assertion response
+	parsedResponse, err := protocol.ParseCredentialRequestResponseBody(r.Body)
+	if err != nil {
+		log.Printf("Error parsing assertion: %v", err)
+		http.Error(w, fmt.Sprintf("invalid assertion: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// Find session data by challenge - already decoded by webauthn library
+	challengeKey := parsedResponse.Response.CollectedClientData.Challenge
+	s.challengeMu.RLock()
+	sessionData, exists := s.challenges[challengeKey]
+	s.challengeMu.RUnlock()
+
+	if !exists {
+		http.Error(w, "challenge not found or expired", http.StatusBadRequest)
+		return
+	}
+
+	// Verify assertion
+	user := NewVaultUser(s.credentials)
+	credential, err := s.webauthn.ValidateLogin(user, *sessionData, parsedResponse)
+	if err != nil {
+		log.Printf("Authentication failed: %v", err)
+		http.Error(w, fmt.Sprintf("authentication failed: %v", err), http.StatusUnauthorized)
+		return
+	}
+
+	// Update sign count
+	if err := s.credentials.UpdateSignCount(credential.ID, credential.Authenticator.SignCount); err != nil {
+		log.Printf("Warning: failed to update sign count: %v", err)
+	}
+
+	// Create session
+	session, err := s.sessions.Create(credential.ID)
+	if err != nil {
+		log.Printf("Error creating session: %v", err)
+		http.Error(w, "failed to create session", http.StatusInternalServerError)
+		return
+	}
+
+	// Cleanup challenge
+	s.challengeMu.Lock()
+	delete(s.challenges, challengeKey)
+	s.challengeMu.Unlock()
+
+	log.Printf("Authentication successful, token expires at %s", session.ExpiresAt.Format(time.RFC3339))
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"token":      session.Token,
+		"expires_at": session.ExpiresAt,
+	})
+}
+
+// handleRegisterBegin starts the FIDO2 credential registration flow
+func (s *StateServer) handleRegisterBegin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// If credentials already exist, require authentication for new registrations
+	if s.credentials.HasCredentials() {
+		authHeader := r.Header.Get("Authorization")
+		if authHeader == "" {
+			http.Error(w, "authentication required to register additional credentials", http.StatusUnauthorized)
+			return
+		}
+		parts := strings.SplitN(authHeader, " ", 2)
+		if len(parts) != 2 || parts[0] != "Bearer" {
+			http.Error(w, "invalid authorization header", http.StatusUnauthorized)
+			return
+		}
+		if _, valid := s.sessions.Validate(parts[1]); !valid {
+			http.Error(w, "invalid or expired token", http.StatusUnauthorized)
+			return
+		}
+	}
+
+	user := NewVaultUser(s.credentials)
+	options, sessionData, err := s.webauthn.BeginRegistration(user, webauthn.WithAttestationFormats([]protocol.AttestationFormat{protocol.AttestationFormatNone}))
+	if err != nil {
+		log.Printf("Error starting registration: %v", err)
+		http.Error(w, fmt.Sprintf("failed to start registration: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Store session data - use raw bytes as key (URLEncodedBase64 is []byte)
+	challengeKey := string(options.Response.Challenge)
+	s.challengeMu.Lock()
+	s.challenges[challengeKey] = sessionData
+	s.challengeMu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(options)
+}
+
+// handleRegisterComplete completes the FIDO2 credential registration
+func (s *StateServer) handleRegisterComplete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Read and log the raw body for debugging
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.Printf("Error reading request body: %v", err)
+		http.Error(w, "failed to read request", http.StatusBadRequest)
+		return
+	}
+	log.Printf("Registration request body (%d bytes): %s", len(bodyBytes), string(bodyBytes))
+
+	// Parse the credential creation response from bytes
+	parsedResponse, err := protocol.ParseCredentialCreationResponseBody(bytes.NewReader(bodyBytes))
+	if err != nil {
+		log.Printf("Error parsing registration response: %v", err)
+		// Try to get more details from the error
+		if pErr, ok := err.(*protocol.Error); ok {
+			log.Printf("  Protocol error type: %s", pErr.Type)
+			log.Printf("  Protocol error details: %s", pErr.Details)
+			log.Printf("  Protocol error info: %s", pErr.DevInfo)
+		}
+		http.Error(w, fmt.Sprintf("invalid registration response: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// Find session data by challenge - already decoded by webauthn library
+	challenge, err := base64.RawURLEncoding.DecodeString(parsedResponse.Response.CollectedClientData.Challenge)
+	challengeKey := string(challenge)
+	if err != nil {
+		log.Panicf("Failed to decode challenge token!")
+		http.Error(w, fmt.Sprintf("invalid challenge token: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	s.challengeMu.RLock()
+	log.Printf("Looking for challenge (base64): %s", base64.RawURLEncoding.EncodeToString([]byte(challengeKey)))
+	log.Printf("Stored challenges:")
+	for k := range s.challenges {
+		log.Printf("  - (base64): %s", base64.RawURLEncoding.EncodeToString([]byte(k)))
+	}
+	sessionData, exists := s.challenges[challengeKey]
+	s.challengeMu.RUnlock()
+
+	if !exists {
+		http.Error(w, "challenge not found or expired", http.StatusBadRequest)
+		return
+	}
+
+	// Complete registration
+	user := NewVaultUser(s.credentials)
+	credential, err := s.webauthn.CreateCredential(user, *sessionData, parsedResponse)
+	if err != nil {
+		log.Printf("Registration failed: %v", err)
+		http.Error(w, fmt.Sprintf("registration failed: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// Store credential
+	fido2Cred := &FIDO2Credential{
+		ID:        credential.ID,
+		PublicKey: credential.PublicKey,
+		AAGUID:    credential.Authenticator.AAGUID,
+		SignCount: credential.Authenticator.SignCount,
+		CreatedAt: time.Now(),
+		Name:      fmt.Sprintf("credential-%d", len(s.credentials.GetCredentials())+1),
+	}
+	if err := s.credentials.AddCredential(fido2Cred); err != nil {
+		log.Printf("Error saving credential: %v", err)
+		http.Error(w, "failed to save credential", http.StatusInternalServerError)
+		return
+	}
+
+	// Cleanup challenge
+	s.challengeMu.Lock()
+	delete(s.challenges, challengeKey)
+	s.challengeMu.Unlock()
+
+	log.Printf("FIDO2 credential registered: %s", fido2Cred.Name)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status": "registered",
+		"name":   fido2Cred.Name,
+	})
 }

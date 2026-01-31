@@ -78,45 +78,95 @@ func (d *SecretDataSource) Read(ctx context.Context, req datasource.ReadRequest,
 		"name": secretName,
 	})
 
-	// Fetch secret from yubivault server
-	url := fmt.Sprintf("%s/secret/%s", d.providerData.ServerURL, secretName)
-	httpResp, err := http.Get(url)
+	// Get authentication token (may require YubiKey touch)
+	token, err := d.providerData.GetAuthToken(ctx)
 	if err != nil {
 		resp.Diagnostics.AddError(
-			"Failed to connect to yubivault server",
-			fmt.Sprintf("Could not reach server at %s: %s", d.providerData.ServerURL, err),
-		)
-		return
-	}
-	defer httpResp.Body.Close()
-
-	if httpResp.StatusCode == http.StatusNotFound {
-		resp.Diagnostics.AddError(
-			"Secret not found",
-			fmt.Sprintf("Secret '%s' does not exist in the vault", secretName),
+			"Authentication failed",
+			fmt.Sprintf("Failed to authenticate with yubivault server: %s", err),
 		)
 		return
 	}
 
-	if httpResp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(httpResp.Body)
-		resp.Diagnostics.AddError(
-			"Failed to retrieve secret",
-			fmt.Sprintf("Server returned status %d: %s", httpResp.StatusCode, string(body)),
-		)
-		return
-	}
-
-	plaintext, err := io.ReadAll(httpResp.Body)
+	// Fetch secret from yubivault server with retry on auth failure
+	plaintext, err := d.fetchSecret(ctx, secretName, token)
 	if err != nil {
-		resp.Diagnostics.AddError(
-			"Failed to read secret response",
-			fmt.Sprintf("Error reading response: %s", err),
-		)
-		return
+		// If unauthorized and we had a token, clear it and retry
+		if token != "" && isUnauthorizedError(err) {
+			tflog.Debug(ctx, "Token expired, re-authenticating")
+			d.providerData.ClearToken()
+
+			token, err = d.providerData.GetAuthToken(ctx)
+			if err != nil {
+				resp.Diagnostics.AddError(
+					"Authentication failed",
+					fmt.Sprintf("Failed to re-authenticate with yubivault server: %s", err),
+				)
+				return
+			}
+
+			plaintext, err = d.fetchSecret(ctx, secretName, token)
+		}
+
+		if err != nil {
+			resp.Diagnostics.AddError(
+				"Failed to retrieve secret",
+				err.Error(),
+			)
+			return
+		}
 	}
 
 	data.Value = types.StringValue(string(plaintext))
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
+}
+
+func (d *SecretDataSource) fetchSecret(ctx context.Context, secretName, token string) ([]byte, error) {
+	url := fmt.Sprintf("%s/secret/%s", d.providerData.ServerURL, secretName)
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	// Add auth header if we have a token
+	if token != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	client := &http.Client{}
+	httpResp, err := client.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("could not reach server at %s: %w", d.providerData.ServerURL, err)
+	}
+	defer httpResp.Body.Close()
+
+	if httpResp.StatusCode == http.StatusUnauthorized {
+		return nil, &unauthorizedError{message: "authentication required"}
+	}
+
+	if httpResp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("secret '%s' does not exist in the vault", secretName)
+	}
+
+	if httpResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(httpResp.Body)
+		return nil, fmt.Errorf("server returned status %d: %s", httpResp.StatusCode, string(body))
+	}
+
+	return io.ReadAll(httpResp.Body)
+}
+
+type unauthorizedError struct {
+	message string
+}
+
+func (e *unauthorizedError) Error() string {
+	return e.message
+}
+
+func isUnauthorizedError(err error) bool {
+	_, ok := err.(*unauthorizedError)
+	return ok
 }
