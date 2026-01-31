@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -83,9 +85,46 @@ func printUsage() {
 	fmt.Println("  state-encrypt <name>   Encrypt a state file (reads from stdin)")
 	fmt.Println("  state-decrypt <name>   Decrypt a state file")
 	fmt.Println("  serve [addr] [--cert cert.pem] [--key key.pem]")
-	fmt.Println("                         Start HTTP server (default: localhost:8099)")
-	fmt.Println("                         Use --cert and --key to enable TLS")
+	fmt.Println("                         Start HTTPS server (default: localhost:8099)")
+	fmt.Println("                         Certificates auto-generated if not provided")
+	fmt.Println("                         Use --cert and --key for custom certificates")
 	fmt.Println("  fido2-register [url]   Register FIDO2 credential for authentication")
+}
+
+// getHTTPClient returns an HTTP client configured to trust self-signed certificates
+// from the vault's TLS directory
+func getHTTPClient() (*http.Client, error) {
+	// Try to load CA certificate from vault/tls/server.crt
+	vaultPath := os.Getenv("YUBIVAULT_PATH")
+	if vaultPath == "" {
+		vaultPath = "vault"
+	}
+	caCertPath := filepath.Join(vaultPath, "tls", "server.crt")
+
+	// Try to load the CA certificate
+	caCert, err := os.ReadFile(caCertPath)
+	if err != nil {
+		// If we can't load the cert, use system defaults
+		// This allows the client to work with properly signed certificates
+		return &http.Client{}, nil
+	}
+
+	// Create certificate pool and add our CA cert
+	caCertPool := x509.NewCertPool()
+	if !caCertPool.AppendCertsFromPEM(caCert) {
+		// If parsing fails, fall back to system defaults
+		return &http.Client{}, nil
+	}
+
+	tlsConfig := &tls.Config{
+		RootCAs: caCertPool,
+	}
+
+	return &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: tlsConfig,
+		},
+	}, nil
 }
 
 func initVault() error {
@@ -309,9 +348,9 @@ func serveStateBackend() error {
 		}
 	}
 
-	// Validate TLS options
+	// Validate TLS options - if providing custom cert, both cert and key required
 	if (certFile != "" && keyFile == "") || (certFile == "" && keyFile != "") {
-		return fmt.Errorf("both --cert and --key must be provided for TLS")
+		return fmt.Errorf("both --cert and --key must be provided together for custom certificates")
 	}
 
 	// Initialize vault
@@ -482,7 +521,7 @@ func stateEncrypt() error {
 }
 
 func fido2Register() error {
-	serverURL := "http://localhost:8099"
+	serverURL := "https://localhost:8099"
 	if len(os.Args) >= 3 {
 		serverURL = os.Args[2]
 	}
@@ -490,8 +529,14 @@ func fido2Register() error {
 	fmt.Println("Registering FIDO2 credential...")
 	fmt.Printf("Server: %s\n", serverURL)
 
+	// Get HTTP client with TLS configuration
+	httpClient, err := getHTTPClient()
+	if err != nil {
+		return fmt.Errorf("failed to create HTTP client: %w", err)
+	}
+
 	// Step 1: Get registration options from server
-	resp, err := http.Get(serverURL + "/auth/register/begin")
+	resp, err := httpClient.Get(serverURL + "/auth/register/begin")
 	if err != nil {
 		return fmt.Errorf("failed to contact server: %w", err)
 	}
@@ -614,7 +659,7 @@ func fido2Register() error {
 		return fmt.Errorf("failed to marshal credential response: %w", err)
 	}
 
-	resp, err = http.Post(
+	resp, err = httpClient.Post(
 		serverURL+"/auth/register/complete",
 		"application/json",
 		bytes.NewReader(payloadJSON),
