@@ -264,7 +264,9 @@ func (v *Vault) decryptWithYubiKey(ciphertext []byte) ([]byte, error) {
 }
 
 // DecryptSecret decrypts a secret using the master key
-func (v *Vault) DecryptSecret(ciphertext []byte) ([]byte, error) {
+// The name parameter is used as Additional Authenticated Data (AAD) to bind
+// the encrypted data to its context and prevent substitution attacks
+func (v *Vault) DecryptSecret(ciphertext []byte, name string) ([]byte, error) {
 	if v.masterKey == nil {
 		return nil, fmt.Errorf("master key not loaded")
 	}
@@ -294,8 +296,9 @@ func (v *Vault) DecryptSecret(ciphertext []byte) ([]byte, error) {
 		return nil, fmt.Errorf("failed to create GCM: %w", err)
 	}
 
-	// Decrypt
-	plaintext, err := gcm.Open(nil, nonce, encryptedData, nil)
+	// Decrypt with AAD (binds decryption to specific name/context)
+	aad := []byte(name)
+	plaintext, err := gcm.Open(nil, nonce, encryptedData, aad)
 	if err != nil {
 		return nil, fmt.Errorf("decryption failed: %w", err)
 	}
@@ -304,7 +307,9 @@ func (v *Vault) DecryptSecret(ciphertext []byte) ([]byte, error) {
 }
 
 // EncryptSecret encrypts a secret using the master key
-func (v *Vault) EncryptSecret(plaintext []byte) ([]byte, error) {
+// The name parameter is used as Additional Authenticated Data (AAD) to bind
+// the encrypted data to its context and prevent substitution attacks
+func (v *Vault) EncryptSecret(plaintext []byte, name string) ([]byte, error) {
 	if v.masterKey == nil {
 		return nil, fmt.Errorf("master key not loaded")
 	}
@@ -326,8 +331,9 @@ func (v *Vault) EncryptSecret(plaintext []byte) ([]byte, error) {
 		return nil, fmt.Errorf("failed to generate nonce: %w", err)
 	}
 
-	// Encrypt
-	ciphertext := gcm.Seal(nonce, nonce, plaintext, nil)
+	// Encrypt with AAD (binds encryption to specific name/context)
+	aad := []byte(name)
+	ciphertext := gcm.Seal(nonce, nonce, plaintext, aad)
 
 	// Encode to base64
 	encoded := base64.StdEncoding.EncodeToString(ciphertext)

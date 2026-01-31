@@ -14,8 +14,8 @@ import (
 
 // Encrypter provides encryption/decryption for credential storage
 type Encrypter interface {
-	EncryptSecret(plaintext []byte) ([]byte, error)
-	DecryptSecret(ciphertext []byte) ([]byte, error)
+	EncryptSecret(plaintext []byte, name string) ([]byte, error)
+	DecryptSecret(ciphertext []byte, name string) ([]byte, error)
 }
 
 // FIDO2Credential represents a registered FIDO2 credential
@@ -67,7 +67,7 @@ func NewCredentialStore(vaultPath string, encrypter Encrypter) (*CredentialStore
 	// Try to load encrypted credentials first
 	if encrypter != nil {
 		if data, err := os.ReadFile(encCredPath); err == nil {
-			plaintext, err := encrypter.DecryptSecret(data)
+			plaintext, err := encrypter.DecryptSecret(data, "fido2-credentials")
 			if err != nil {
 				return nil, fmt.Errorf("failed to decrypt credentials: %w", err)
 			}
@@ -146,7 +146,7 @@ func (cs *CredentialStore) save() error {
 
 	// Encrypt if encrypter is available
 	if cs.encrypter != nil {
-		encrypted, err := cs.encrypter.EncryptSecret(data)
+		encrypted, err := cs.encrypter.EncryptSecret(data, "fido2-credentials")
 		if err != nil {
 			return fmt.Errorf("failed to encrypt credentials: %w", err)
 		}
