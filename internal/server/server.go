@@ -120,7 +120,8 @@ func NewStateServer(vault *yubikey.Vault, vaultPath, addr string) (*StateServer,
 }
 
 // Start starts the HTTP server
-func (s *StateServer) Start(addr string) error {
+// If certFile and keyFile are provided, starts with TLS enabled
+func (s *StateServer) Start(addr, certFile, keyFile string) error {
 	mux := http.NewServeMux()
 
 	// Auth endpoints (no authentication required)
@@ -140,8 +141,20 @@ func (s *StateServer) Start(addr string) error {
 		WriteTimeout: 30 * time.Second,
 	}
 
+	useTLS := certFile != "" && keyFile != ""
+	scheme := "http"
+	if useTLS {
+		scheme = "https"
+	}
+
 	log.Printf("Starting YubiVault server on %s", addr)
 	log.Printf("Vault path: %s", s.vaultPath)
+	if useTLS {
+		log.Printf("TLS: ENABLED (cert: %s, key: %s)", certFile, keyFile)
+	} else {
+		log.Printf("TLS: DISABLED (WARNING: secrets transmitted in plaintext)")
+		log.Printf("  For production use, provide --cert and --key flags")
+	}
 	if s.credentials.HasCredentials() {
 		log.Printf("FIDO2 authentication: ENABLED")
 	} else {
@@ -153,9 +166,17 @@ func (s *StateServer) Start(addr string) error {
 	log.Printf("  *    /state/{project} - Terraform state backend")
 	log.Printf("  GET  /auth/challenge  - Get FIDO2 authentication challenge")
 	log.Printf("  POST /auth/verify     - Verify FIDO2 assertion")
-	log.Printf("\nConfigure Terraform provider with:")
+	log.Printf("\nConfigure Terraform with:")
+	log.Printf("  terraform {")
+	log.Printf("    backend \"http\" {")
+	log.Printf("      address        = \"%s://%s/state/myproject\"", scheme, addr)
+	log.Printf("      lock_address   = \"%s://%s/state/myproject\"", scheme, addr)
+	log.Printf("      unlock_address = \"%s://%s/state/myproject\"", scheme, addr)
+	log.Printf("    }")
+	log.Printf("  }")
+	log.Printf("")
 	log.Printf("  provider \"yubivault\" {")
-	log.Printf("    server_url = \"http://%s\"", addr)
+	log.Printf("    server_url = \"%s://%s\"", scheme, addr)
 	log.Printf("  }")
 
 	// Start background cleanup routine
@@ -163,6 +184,9 @@ func (s *StateServer) Start(addr string) error {
 	s.cleanupCancel = cleanupCancel
 	s.startCleanupRoutine(cleanupCtx)
 
+	if useTLS {
+		return s.server.ListenAndServeTLS(certFile, keyFile)
+	}
 	return s.server.ListenAndServe()
 }
 
@@ -276,8 +300,8 @@ func (s *StateServer) getState(w http.ResponseWriter, r *http.Request, project s
 		return
 	}
 
-	// Decrypt state
-	plaintext, err := s.vault.DecryptSecret(encryptedState)
+	// Decrypt state (using project name as AAD)
+	plaintext, err := s.vault.DecryptSecret(encryptedState, "state:"+project)
 	if err != nil {
 		log.Printf("Error decrypting state: %v", err)
 		http.Error(w, "failed to decrypt state", http.StatusInternalServerError)
@@ -315,8 +339,8 @@ func (s *StateServer) postState(w http.ResponseWriter, r *http.Request, project 
 	}
 	defer r.Body.Close()
 
-	// Encrypt state
-	encrypted, err := s.vault.EncryptSecret(body)
+	// Encrypt state (using project name as AAD)
+	encrypted, err := s.vault.EncryptSecret(body, "state:"+project)
 	if err != nil {
 		log.Printf("Error encrypting state: %v", err)
 		http.Error(w, "failed to encrypt state", http.StatusInternalServerError)
@@ -433,8 +457,8 @@ func (s *StateServer) handleSecret(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Decrypt secret
-	plaintext, err := s.vault.DecryptSecret(encryptedSecret)
+	// Decrypt secret (using secret name as AAD)
+	plaintext, err := s.vault.DecryptSecret(encryptedSecret, "secret:"+name)
 	if err != nil {
 		log.Printf("Error decrypting secret '%s': %v", name, err)
 		http.Error(w, "failed to decrypt secret", http.StatusInternalServerError)

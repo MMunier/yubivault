@@ -82,7 +82,9 @@ func printUsage() {
 	fmt.Println("  decrypt <name>         Decrypt a secret")
 	fmt.Println("  state-encrypt <name>   Encrypt a state file (reads from stdin)")
 	fmt.Println("  state-decrypt <name>   Decrypt a state file")
-	fmt.Println("  serve [addr]           Start HTTP server (default: localhost:8099)")
+	fmt.Println("  serve [addr] [--cert cert.pem] [--key key.pem]")
+	fmt.Println("                         Start HTTP server (default: localhost:8099)")
+	fmt.Println("                         Use --cert and --key to enable TLS")
 	fmt.Println("  fido2-register [url]   Register FIDO2 credential for authentication")
 }
 
@@ -192,8 +194,8 @@ func encryptSecret() error {
 	}
 	defer vault.Close()
 
-	// Encrypt secret
-	ciphertext, err := vault.EncryptSecret(plaintext)
+	// Encrypt secret (using secret name as AAD)
+	ciphertext, err := vault.EncryptSecret(plaintext, "secret:"+secretName)
 	if err != nil {
 		return err
 	}
@@ -256,8 +258,8 @@ func decryptSecret() error {
 		return fmt.Errorf("failed to read secret: %w", err)
 	}
 
-	// Decrypt secret
-	plaintext, err := vault.DecryptSecret(ciphertext)
+	// Decrypt secret (using secret name as AAD)
+	plaintext, err := vault.DecryptSecret(ciphertext, "secret:"+secretName)
 	if err != nil {
 		return err
 	}
@@ -289,10 +291,27 @@ func serveStateBackend() error {
 		pin = string(pinBytes)
 	}
 
-	// Default address
+	// Parse arguments for address and TLS options
 	addr := "localhost:8099"
-	if len(os.Args) >= 3 {
-		addr = os.Args[2]
+	certFile := ""
+	keyFile := ""
+
+	for i := 2; i < len(os.Args); i++ {
+		arg := os.Args[i]
+		if arg == "--cert" && i+1 < len(os.Args) {
+			certFile = os.Args[i+1]
+			i++
+		} else if arg == "--key" && i+1 < len(os.Args) {
+			keyFile = os.Args[i+1]
+			i++
+		} else if !startsWith(arg, "--") {
+			addr = arg
+		}
+	}
+
+	// Validate TLS options
+	if (certFile != "" && keyFile == "") || (certFile == "" && keyFile != "") {
+		return fmt.Errorf("both --cert and --key must be provided for TLS")
 	}
 
 	// Initialize vault
@@ -321,12 +340,17 @@ func serveStateBackend() error {
 		srv.Shutdown(ctx)
 	}()
 
-	// Start server
-	if err := srv.Start(addr); err != nil && err.Error() != "http: Server closed" {
+	// Start server with optional TLS
+	if err := srv.Start(addr, certFile, keyFile); err != nil && err.Error() != "http: Server closed" {
 		return err
 	}
 
 	return nil
+}
+
+// Helper function to check if a string starts with a prefix
+func startsWith(s, prefix string) bool {
+	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
 }
 
 func stateDecrypt() error {
@@ -376,8 +400,8 @@ func stateDecrypt() error {
 		return fmt.Errorf("failed to read state file: %w", err)
 	}
 
-	// Decrypt state
-	plaintext, err := vault.DecryptSecret(ciphertext)
+	// Decrypt state (using project name as AAD)
+	plaintext, err := vault.DecryptSecret(ciphertext, "state:"+projectName)
 	if err != nil {
 		return err
 	}
@@ -434,8 +458,8 @@ func stateEncrypt() error {
 	}
 	defer vault.Close()
 
-	// Encrypt state
-	ciphertext, err := vault.EncryptSecret(plaintext)
+	// Encrypt state (using project name as AAD)
+	ciphertext, err := vault.EncryptSecret(plaintext, "state:"+projectName)
 	if err != nil {
 		return err
 	}
