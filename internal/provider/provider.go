@@ -2,7 +2,12 @@ package provider
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -21,7 +26,9 @@ type YubivaultProvider struct {
 }
 
 type YubivaultProviderModel struct {
-	ServerURL types.String `tfsdk:"server_url"`
+	ServerURL          types.String `tfsdk:"server_url"`
+	TLSCACert          types.String `tfsdk:"tls_ca_cert"`
+	InsecureSkipVerify types.Bool   `tfsdk:"insecure_skip_verify"`
 }
 
 func New(version string) func() provider.Provider {
@@ -42,8 +49,16 @@ func (p *YubivaultProvider) Schema(ctx context.Context, req provider.SchemaReque
 		Description: "Terraform provider for secrets encrypted with YubiKey PIV as trust anchor. Requires yubivault server to be running.",
 		Attributes: map[string]schema.Attribute{
 			"server_url": schema.StringAttribute{
-				Description: "URL of yubivault server (e.g., http://localhost:8099)",
+				Description: "URL of yubivault server (e.g., https://localhost:8099). Always use https:// as the server only supports TLS.",
 				Required:    true,
+			},
+			"tls_ca_cert": schema.StringAttribute{
+				Description: "Path to CA certificate file for verifying the server's certificate. If not set, the provider will automatically try to load the certificate from ${YUBIVAULT_PATH}/tls/server.crt (useful when provider and server share the same vault directory).",
+				Optional:    true,
+			},
+			"insecure_skip_verify": schema.BoolAttribute{
+				Description: "Skip TLS certificate verification (INSECURE - for development only). A warning will be logged if enabled.",
+				Optional:    true,
 			},
 		},
 	}
@@ -59,7 +74,14 @@ func (p *YubivaultProvider) Configure(ctx context.Context, req provider.Configur
 
 	// Create provider data that will be passed to data sources and resources
 	providerData := &ProviderData{
-		ServerURL: config.ServerURL.ValueString(),
+		ServerURL:          config.ServerURL.ValueString(),
+		TLSCACert:          config.TLSCACert.ValueString(),
+		InsecureSkipVerify: config.InsecureSkipVerify.ValueBool(),
+	}
+
+	// Warn if insecure mode is enabled
+	if providerData.InsecureSkipVerify {
+		tflog.Warn(ctx, "TLS certificate verification is DISABLED (insecure_skip_verify=true) - this should only be used for development")
 	}
 
 	resp.DataSourceData = providerData
@@ -77,7 +99,9 @@ func (p *YubivaultProvider) DataSources(ctx context.Context) []func() datasource
 }
 
 type ProviderData struct {
-	ServerURL string
+	ServerURL          string
+	TLSCACert          string
+	InsecureSkipVerify bool
 
 	// Authentication state
 	mu           sync.Mutex
@@ -98,7 +122,7 @@ func (p *ProviderData) GetAuthToken(ctx context.Context) (string, error) {
 
 	// Initialize FIDO2 client if needed
 	if p.fido2Client == nil {
-		p.fido2Client = NewFIDO2Client(p.ServerURL)
+		p.fido2Client = NewFIDO2Client(p)
 	}
 
 	tflog.Info(ctx, "Authenticating with FIDO2 - touch your YubiKey")
@@ -131,4 +155,63 @@ func (p *ProviderData) ClearToken() {
 	defer p.mu.Unlock()
 	p.sessionToken = ""
 	p.tokenExpiry = time.Time{}
+}
+
+// GetHTTPClient returns an HTTP client configured with TLS settings
+func (p *ProviderData) GetHTTPClient() (*http.Client, error) {
+	tlsConfig := &tls.Config{}
+
+	// If insecure mode is enabled, skip verification
+	if p.InsecureSkipVerify {
+		tlsConfig.InsecureSkipVerify = true
+		return &http.Client{
+			Transport: &http.Transport{
+				TLSClientConfig: tlsConfig,
+			},
+		}, nil
+	}
+
+	// Try to load CA certificate with priority:
+	// 1. Explicit tls_ca_cert path
+	// 2. ${YUBIVAULT_PATH}/tls/server.crt
+	// 3. ./vault/tls/server.crt (default)
+	var caCertPath string
+
+	if p.TLSCACert != "" {
+		// Priority 1: Use explicitly configured path
+		caCertPath = p.TLSCACert
+	} else {
+		// Priority 2: Try YUBIVAULT_PATH env var
+		vaultPath := os.Getenv("YUBIVAULT_PATH")
+		if vaultPath == "" {
+			// Priority 3: Use default ./vault
+			vaultPath = "vault"
+		}
+		caCertPath = filepath.Join(vaultPath, "tls", "server.crt")
+	}
+
+	// Try to load the CA certificate
+	caCert, err := os.ReadFile(caCertPath)
+	if err != nil {
+		// If we can't load the cert and it wasn't explicitly specified, use system defaults
+		if p.TLSCACert == "" {
+			// No custom cert found, use system certificate pool
+			return &http.Client{}, nil
+		}
+		return nil, fmt.Errorf("failed to read CA certificate from %s: %w", caCertPath, err)
+	}
+
+	// Create certificate pool and add our CA cert
+	caCertPool := x509.NewCertPool()
+	if !caCertPool.AppendCertsFromPEM(caCert) {
+		return nil, fmt.Errorf("failed to parse CA certificate from %s", caCertPath)
+	}
+
+	tlsConfig.RootCAs = caCertPool
+
+	return &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: tlsConfig,
+		},
+	}, nil
 }
