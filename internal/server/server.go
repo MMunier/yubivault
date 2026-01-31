@@ -20,6 +20,17 @@ import (
 	"github.com/mmunier/terraform-provider-yubivault/internal/yubikey"
 )
 
+const (
+	// MaxRequestBodySize is the maximum allowed request body size (10MB)
+	MaxRequestBodySize = 10 * 1024 * 1024
+
+	// ChallengeTTL is how long WebAuthn challenges remain valid
+	ChallengeTTL = 60 * time.Second
+
+	// LockTTL is how long state locks remain valid before auto-expiring
+	LockTTL = 30 * time.Minute
+)
+
 // StateServer provides an HTTP backend for Terraform state storage
 // and secrets with YubiKey-backed encryption
 type StateServer struct {
@@ -32,12 +43,19 @@ type StateServer struct {
 	server     *http.Server
 
 	// FIDO2/WebAuthn authentication
-	webauthn    *webauthn.WebAuthn
-	sessions    *SessionStore
-	credentials *CredentialStore
-	authMw      *AuthMiddleware
-	challenges  map[string]*webauthn.SessionData
-	challengeMu sync.RWMutex
+	webauthn      *webauthn.WebAuthn
+	sessions      *SessionStore
+	credentials   *CredentialStore
+	authMw        *AuthMiddleware
+	challenges    map[string]*challengeData
+	challengeMu   sync.RWMutex
+	cleanupCancel context.CancelFunc
+}
+
+// challengeData wraps WebAuthn session data with creation time for expiration
+type challengeData struct {
+	sessionData *webauthn.SessionData
+	createdAt   time.Time
 }
 
 // StateLock represents a lock on a state file
@@ -52,7 +70,8 @@ type StateLock struct {
 }
 
 // NewStateServer creates a new state server
-func NewStateServer(vault *yubikey.Vault, vaultPath string) (*StateServer, error) {
+// The addr parameter is used to configure the WebAuthn relying party origin
+func NewStateServer(vault *yubikey.Vault, vaultPath, addr string) (*StateServer, error) {
 	stateDir := filepath.Join(vaultPath, "state")
 	secretsDir := filepath.Join(vaultPath, "secrets")
 
@@ -61,11 +80,17 @@ func NewStateServer(vault *yubikey.Vault, vaultPath string) (*StateServer, error
 		return nil, fmt.Errorf("failed to create state directory: %w", err)
 	}
 
-	// Initialize WebAuthn
+	// Extract hostname for RPID (without port)
+	rpID := addr
+	if colonIdx := strings.Index(addr, ":"); colonIdx != -1 {
+		rpID = addr[:colonIdx]
+	}
+
+	// Initialize WebAuthn with configurable origin based on server address
 	wconfig := &webauthn.Config{
 		RPDisplayName: "YubiVault",
-		RPID:          "localhost",
-		RPOrigins:     []string{"http://localhost:8099"},
+		RPID:          rpID,
+		RPOrigins:     []string{fmt.Sprintf("http://%s", addr)},
 	}
 	webauthnInstance, err := webauthn.New(wconfig)
 	if err != nil {
@@ -90,7 +115,7 @@ func NewStateServer(vault *yubikey.Vault, vaultPath string) (*StateServer, error
 		sessions:    sessions,
 		credentials: credentials,
 		authMw:      NewAuthMiddleware(sessions, credentials),
-		challenges:  make(map[string]*webauthn.SessionData),
+		challenges:  make(map[string]*challengeData),
 	}, nil
 }
 
@@ -133,15 +158,68 @@ func (s *StateServer) Start(addr string) error {
 	log.Printf("    server_url = \"http://%s\"", addr)
 	log.Printf("  }")
 
+	// Start background cleanup routine
+	cleanupCtx, cleanupCancel := context.WithCancel(context.Background())
+	s.cleanupCancel = cleanupCancel
+	s.startCleanupRoutine(cleanupCtx)
+
 	return s.server.ListenAndServe()
 }
 
 // Shutdown gracefully shuts down the server
 func (s *StateServer) Shutdown(ctx context.Context) error {
+	// Stop cleanup routine
+	if s.cleanupCancel != nil {
+		s.cleanupCancel()
+	}
 	if s.server != nil {
 		return s.server.Shutdown(ctx)
 	}
 	return nil
+}
+
+// startCleanupRoutine starts a background goroutine that periodically cleans up
+// expired sessions, challenges, and state locks
+func (s *StateServer) startCleanupRoutine(ctx context.Context) {
+	ticker := time.NewTicker(1 * time.Minute)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				ticker.Stop()
+				return
+			case <-ticker.C:
+				s.cleanup()
+			}
+		}
+	}()
+}
+
+// cleanup removes expired sessions, challenges, and state locks
+func (s *StateServer) cleanup() {
+	now := time.Now()
+
+	// Cleanup expired sessions
+	s.sessions.Cleanup()
+
+	// Cleanup expired challenges
+	s.challengeMu.Lock()
+	for key, challenge := range s.challenges {
+		if now.Sub(challenge.createdAt) > ChallengeTTL {
+			delete(s.challenges, key)
+		}
+	}
+	s.challengeMu.Unlock()
+
+	// Cleanup expired state locks
+	s.lockMu.Lock()
+	for project, lock := range s.locks {
+		if now.Sub(lock.Created) > LockTTL {
+			log.Printf("Auto-expiring stale lock for '%s' (held by %s)", project, lock.Who)
+			delete(s.locks, project)
+		}
+	}
+	s.lockMu.Unlock()
 }
 
 // logMiddleware logs incoming requests
@@ -228,8 +306,8 @@ func (s *StateServer) postState(w http.ResponseWriter, r *http.Request, project 
 		}
 	}
 
-	// Read state from request body
-	body, err := io.ReadAll(r.Body)
+	// Read state from request body (with size limit)
+	body, err := io.ReadAll(io.LimitReader(r.Body, MaxRequestBodySize))
 	if err != nil {
 		log.Printf("Error reading request body: %v", err)
 		http.Error(w, "failed to read request", http.StatusBadRequest)
@@ -390,7 +468,10 @@ func (s *StateServer) handleAuthChallenge(w http.ResponseWriter, r *http.Request
 	// Store session data keyed by challenge - use raw bytes as key
 	challengeKey := string(options.Response.Challenge)
 	s.challengeMu.Lock()
-	s.challenges[challengeKey] = sessionData
+	s.challenges[challengeKey] = &challengeData{
+		sessionData: sessionData,
+		createdAt:   time.Now(),
+	}
 	s.challengeMu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
@@ -415,17 +496,23 @@ func (s *StateServer) handleAuthVerify(w http.ResponseWriter, r *http.Request) {
 	// Find session data by challenge - already decoded by webauthn library
 	challengeKey := parsedResponse.Response.CollectedClientData.Challenge
 	s.challengeMu.RLock()
-	sessionData, exists := s.challenges[challengeKey]
+	challenge, exists := s.challenges[challengeKey]
 	s.challengeMu.RUnlock()
 
-	if !exists {
+	if !exists || time.Since(challenge.createdAt) > ChallengeTTL {
+		if exists {
+			// Clean up expired challenge
+			s.challengeMu.Lock()
+			delete(s.challenges, challengeKey)
+			s.challengeMu.Unlock()
+		}
 		http.Error(w, "challenge not found or expired", http.StatusBadRequest)
 		return
 	}
 
 	// Verify assertion
 	user := NewVaultUser(s.credentials)
-	credential, err := s.webauthn.ValidateLogin(user, *sessionData, parsedResponse)
+	credential, err := s.webauthn.ValidateLogin(user, *challenge.sessionData, parsedResponse)
 	if err != nil {
 		log.Printf("Authentication failed: %v", err)
 		http.Error(w, fmt.Sprintf("authentication failed: %v", err), http.StatusUnauthorized)
@@ -495,7 +582,10 @@ func (s *StateServer) handleRegisterBegin(w http.ResponseWriter, r *http.Request
 	// Store session data - use raw bytes as key (URLEncodedBase64 is []byte)
 	challengeKey := string(options.Response.Challenge)
 	s.challengeMu.Lock()
-	s.challenges[challengeKey] = sessionData
+	s.challenges[challengeKey] = &challengeData{
+		sessionData: sessionData,
+		createdAt:   time.Now(),
+	}
 	s.challengeMu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
@@ -509,7 +599,7 @@ func (s *StateServer) handleRegisterComplete(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	bodyBytes, err := io.ReadAll(r.Body)
+	bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, MaxRequestBodySize))
 	if err != nil {
 		log.Printf("Error reading request body: %v", err)
 		http.Error(w, "failed to read request", http.StatusBadRequest)
@@ -525,26 +615,32 @@ func (s *StateServer) handleRegisterComplete(w http.ResponseWriter, r *http.Requ
 	}
 
 	// Find session data by challenge - already decoded by webauthn library
-	challenge, err := base64.RawURLEncoding.DecodeString(parsedResponse.Response.CollectedClientData.Challenge)
+	challengeBytes, err := base64.RawURLEncoding.DecodeString(parsedResponse.Response.CollectedClientData.Challenge)
 	if err != nil {
 		log.Printf("Failed to decode challenge token: %v", err)
 		http.Error(w, fmt.Sprintf("invalid challenge token: %v", err), http.StatusBadRequest)
 		return
 	}
-	challengeKey := string(challenge)
+	challengeKey := string(challengeBytes)
 
 	s.challengeMu.RLock()
-	sessionData, exists := s.challenges[challengeKey]
+	challenge, exists := s.challenges[challengeKey]
 	s.challengeMu.RUnlock()
 
-	if !exists {
+	if !exists || time.Since(challenge.createdAt) > ChallengeTTL {
+		if exists {
+			// Clean up expired challenge
+			s.challengeMu.Lock()
+			delete(s.challenges, challengeKey)
+			s.challengeMu.Unlock()
+		}
 		http.Error(w, "challenge not found or expired", http.StatusBadRequest)
 		return
 	}
 
 	// Complete registration
 	user := NewVaultUser(s.credentials)
-	credential, err := s.webauthn.CreateCredential(user, *sessionData, parsedResponse)
+	credential, err := s.webauthn.CreateCredential(user, *challenge.sessionData, parsedResponse)
 	if err != nil {
 		log.Printf("Registration failed: %v", err)
 		http.Error(w, fmt.Sprintf("registration failed: %v", err), http.StatusBadRequest)

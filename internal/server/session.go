@@ -2,6 +2,7 @@ package server
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/base64"
 	"sync"
 	"time"
@@ -60,21 +61,24 @@ func (s *SessionStore) Create(credentialID []byte) (*Session, error) {
 }
 
 // Validate checks if a token is valid and returns the session
+// Uses constant-time comparison to prevent timing attacks
 func (s *SessionStore) Validate(token string) (*Session, bool) {
 	s.mu.RLock()
-	session, exists := s.sessions[token]
-	s.mu.RUnlock()
+	defer s.mu.RUnlock()
 
-	if !exists {
-		return nil, false
+	// Use constant-time comparison to prevent timing attacks
+	tokenBytes := []byte(token)
+	for storedToken, session := range s.sessions {
+		if subtle.ConstantTimeCompare(tokenBytes, []byte(storedToken)) == 1 {
+			if time.Now().After(session.ExpiresAt) {
+				// Don't revoke here to avoid lock upgrade; cleanup will handle it
+				return nil, false
+			}
+			return session, true
+		}
 	}
 
-	if time.Now().After(session.ExpiresAt) {
-		s.Revoke(token)
-		return nil, false
-	}
-
-	return session, true
+	return nil, false
 }
 
 // Revoke removes a session

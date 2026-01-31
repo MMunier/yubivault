@@ -303,7 +303,7 @@ func serveStateBackend() error {
 	defer vault.Close()
 
 	// Create server
-	srv, err := server.NewStateServer(vault, vaultPath)
+	srv, err := server.NewStateServer(vault, vaultPath, addr)
 	if err != nil {
 		return err
 	}
