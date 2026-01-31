@@ -86,11 +86,11 @@ func NewStateServer(vault *yubikey.Vault, vaultPath, addr string) (*StateServer,
 		rpID = addr[:colonIdx]
 	}
 
-	// Initialize WebAuthn with configurable origin based on server address
+	// Initialize WebAuthn with configurable origin based on server address (always HTTPS)
 	wconfig := &webauthn.Config{
 		RPDisplayName: "YubiVault",
 		RPID:          rpID,
-		RPOrigins:     []string{fmt.Sprintf("http://%s", addr)},
+		RPOrigins:     []string{fmt.Sprintf("https://%s", addr)},
 	}
 	webauthnInstance, err := webauthn.New(wconfig)
 	if err != nil {
@@ -119,9 +119,52 @@ func NewStateServer(vault *yubikey.Vault, vaultPath, addr string) (*StateServer,
 	}, nil
 }
 
-// Start starts the HTTP server
-// If certFile and keyFile are provided, starts with TLS enabled
+// Start starts the HTTPS server (always uses TLS)
+// Certificate priority: 1) explicit certFile/keyFile, 2) vault/tls/ directory, 3) auto-generate
 func (s *StateServer) Start(addr, certFile, keyFile string) error {
+	// Determine certificate paths with priority logic
+	var finalCertFile, finalKeyFile string
+	var certSource string
+
+	if certFile != "" && keyFile != "" {
+		// Priority 1: Use explicitly provided certificate paths
+		finalCertFile = certFile
+		finalKeyFile = keyFile
+		certSource = "explicit"
+	} else {
+		// Priority 2: Check for certificates in vault/tls/ directory
+		tlsDir := filepath.Join(s.vaultPath, "tls")
+		defaultCertFile := filepath.Join(tlsDir, "server.crt")
+		defaultKeyFile := filepath.Join(tlsDir, "server.key")
+
+		if _, err := os.Stat(defaultCertFile); err == nil {
+			if _, err := os.Stat(defaultKeyFile); err == nil {
+				// Use existing certificates from vault/tls/
+				finalCertFile = defaultCertFile
+				finalKeyFile = defaultKeyFile
+				certSource = "vault"
+			}
+		}
+
+		// Priority 3: Auto-generate if no certificates found
+		if finalCertFile == "" {
+			if err := GenerateSelfSignedCert(defaultCertFile, defaultKeyFile); err != nil {
+				return fmt.Errorf("failed to generate self-signed certificate: %w", err)
+			}
+			finalCertFile = defaultCertFile
+			finalKeyFile = defaultKeyFile
+			certSource = "auto-generated"
+			log.Printf("Generated new self-signed certificate in %s", tlsDir)
+		}
+	}
+
+	// Get certificate fingerprint for logging
+	fingerprint, err := GetCertFingerprint(finalCertFile)
+	if err != nil {
+		log.Printf("Warning: failed to get certificate fingerprint: %v", err)
+		fingerprint = "unknown"
+	}
+
 	mux := http.NewServeMux()
 
 	// Auth endpoints (no authentication required)
@@ -141,19 +184,13 @@ func (s *StateServer) Start(addr, certFile, keyFile string) error {
 		WriteTimeout: 30 * time.Second,
 	}
 
-	useTLS := certFile != "" && keyFile != ""
-	scheme := "http"
-	if useTLS {
-		scheme = "https"
-	}
-
 	log.Printf("Starting YubiVault server on %s", addr)
 	log.Printf("Vault path: %s", s.vaultPath)
-	if useTLS {
-		log.Printf("TLS: ENABLED (cert: %s, key: %s)", certFile, keyFile)
-	} else {
-		log.Printf("TLS: DISABLED (WARNING: secrets transmitted in plaintext)")
-		log.Printf("  For production use, provide --cert and --key flags")
+	log.Printf("TLS: ENABLED (HTTPS only)")
+	log.Printf("  Certificate: %s (%s)", finalCertFile, certSource)
+	log.Printf("  Fingerprint: %s", fingerprint)
+	if certSource == "auto-generated" || certSource == "vault" {
+		log.Printf("  Note: Self-signed certificate - clients must trust manually or use insecure_skip_verify")
 	}
 	if s.credentials.HasCredentials() {
 		log.Printf("FIDO2 authentication: ENABLED")
@@ -169,14 +206,14 @@ func (s *StateServer) Start(addr, certFile, keyFile string) error {
 	log.Printf("\nConfigure Terraform with:")
 	log.Printf("  terraform {")
 	log.Printf("    backend \"http\" {")
-	log.Printf("      address        = \"%s://%s/state/myproject\"", scheme, addr)
-	log.Printf("      lock_address   = \"%s://%s/state/myproject\"", scheme, addr)
-	log.Printf("      unlock_address = \"%s://%s/state/myproject\"", scheme, addr)
+	log.Printf("      address        = \"https://%s/state/myproject\"", addr)
+	log.Printf("      lock_address   = \"https://%s/state/myproject\"", addr)
+	log.Printf("      unlock_address = \"https://%s/state/myproject\"", addr)
 	log.Printf("    }")
 	log.Printf("  }")
 	log.Printf("")
 	log.Printf("  provider \"yubivault\" {")
-	log.Printf("    server_url = \"%s://%s\"", scheme, addr)
+	log.Printf("    server_url = \"https://%s\"", addr)
 	log.Printf("  }")
 
 	// Start background cleanup routine
@@ -184,10 +221,8 @@ func (s *StateServer) Start(addr, certFile, keyFile string) error {
 	s.cleanupCancel = cleanupCancel
 	s.startCleanupRoutine(cleanupCtx)
 
-	if useTLS {
-		return s.server.ListenAndServeTLS(certFile, keyFile)
-	}
-	return s.server.ListenAndServe()
+	// Always use HTTPS
+	return s.server.ListenAndServeTLS(finalCertFile, finalKeyFile)
 }
 
 // Shutdown gracefully shuts down the server
