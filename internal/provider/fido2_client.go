@@ -18,18 +18,28 @@ import (
 
 // FIDO2Client handles FIDO2 authentication with the yubivault server
 type FIDO2Client struct {
-	serverURL string
+	serverURL    string
+	providerData *ProviderData
 }
 
 // NewFIDO2Client creates a new FIDO2 client
-func NewFIDO2Client(serverURL string) *FIDO2Client {
-	return &FIDO2Client{serverURL: serverURL}
+func NewFIDO2Client(providerData *ProviderData) *FIDO2Client {
+	return &FIDO2Client{
+		serverURL:    providerData.ServerURL,
+		providerData: providerData,
+	}
 }
 
 // Authenticate performs FIDO2 authentication and returns a session token
 func (c *FIDO2Client) Authenticate() (string, time.Time, error) {
+	// Get HTTP client with TLS configuration
+	httpClient, err := c.providerData.GetHTTPClient()
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("failed to create HTTP client: %w", err)
+	}
+
 	// Step 1: Get challenge from server
-	resp, err := http.Get(c.serverURL + "/auth/challenge")
+	resp, err := httpClient.Get(c.serverURL + "/auth/challenge")
 	if err != nil {
 		return "", time.Time{}, fmt.Errorf("failed to contact server: %w", err)
 	}
@@ -139,7 +149,7 @@ func (c *FIDO2Client) Authenticate() (string, time.Time, error) {
 	}
 
 	// Step 7: Send assertion to server
-	resp, err = http.Post(
+	resp, err = httpClient.Post(
 		c.serverURL+"/auth/verify",
 		"application/json",
 		bytes.NewReader(payloadJSON),

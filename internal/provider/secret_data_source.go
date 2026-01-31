@@ -135,7 +135,11 @@ func (d *SecretDataSource) fetchSecret(ctx context.Context, secretName, token st
 		httpReq.Header.Set("Authorization", "Bearer "+token)
 	}
 
-	client := &http.Client{}
+	client, err := d.providerData.GetHTTPClient()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create HTTP client: %w", err)
+	}
+
 	httpResp, err := client.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("could not reach server at %s: %w", d.providerData.ServerURL, err)
