@@ -79,6 +79,7 @@ export YUBIKEY_PIN=123456
 This creates:
 - `vault/master.key` - Master encryption key (encrypted by YubiKey)
 - `vault/secrets/` - Directory for encrypted secrets
+- `vault/state/` - Directory for Terraform state files
 
 ### 2. Add secrets
 
@@ -95,7 +96,23 @@ cat <<EOF | ./yubivault encrypt api_config
 EOF
 ```
 
-### 3. Use in Terraform
+### 3. Start the YubiVault server
+
+The server provides HTTPS endpoints for secret retrieval and Terraform state storage:
+
+```bash
+# Start server (auto-generates self-signed certificate)
+./yubivault serve
+# → Starts on https://localhost:8099
+# → Certificate saved to vault/tls/server.crt
+
+# Or use custom certificate for production
+./yubivault serve --cert /path/to/cert.pem --key /path/to/key.pem
+```
+
+The server authenticates with your YubiKey once at startup, then serves secrets over HTTPS.
+
+### 4. Use in Terraform
 
 ```hcl
 terraform {
@@ -105,12 +122,21 @@ terraform {
       version = "0.1.0"
     }
   }
+
+  # Optional: Use YubiVault as Terraform state backend
+  backend "http" {
+    address        = "https://localhost:8099/state/myproject"
+    lock_address   = "https://localhost:8099/state/myproject"
+    unlock_address = "https://localhost:8099/state/myproject"
+  }
 }
 
 provider "yubivault" {
-  vault_path = "./vault"
-  piv_slot   = "9d"
-  piv_pin    = "123456"  # Or use YUBIKEY_PIN env var
+  server_url = "https://localhost:8099"
+
+  # TLS configuration (optional):
+  # tls_ca_cert          = "/path/to/ca.crt"  # For custom certificates
+  # insecure_skip_verify = true               # Skip cert verification (dev only)
 }
 
 data "yubivault_secret" "db_password" {
@@ -123,11 +149,11 @@ resource "postgresql_database" "example" {
 }
 ```
 
-### 4. Run Terraform
+### 5. Run Terraform
 
 ```bash
 terraform init
-terraform plan  # Touch YubiKey once to decrypt master key
+terraform plan   # Provider fetches secrets from server
 terraform apply
 ```
 
@@ -148,7 +174,39 @@ terraform apply
 | `9d` | Key Management | Encryption | **Recommended for vault** |
 | `9e` | Card Authentication | Physical access | Not recommended for vault |
 
+## FIDO2 Authentication (Optional)
+
+YubiVault supports optional FIDO2/WebAuthn authentication for multi-user access control. When FIDO2 credentials are registered, the server requires authentication for secret and state access.
+
+### Register FIDO2 Credential
+
+```bash
+# Start server first
+yubivault serve
+
+# In another terminal, register your security key
+yubivault fido2-register https://localhost:8099
+# → Touch your YubiKey to complete registration
+```
+
+Once registered, the Terraform provider will prompt for YubiKey touch during authentication. Sessions are cached for 1 hour.
+
+### Disable FIDO2 Authentication
+
+To remove authentication requirements, delete the credentials file:
+
+```bash
+rm vault/credentials.enc
+```
+
 ## Security Considerations
+
+### Transport Security
+
+- Server **always uses HTTPS** to protect secrets in transit
+- Self-signed certificates are auto-generated for development
+- Use proper certificates (Let's Encrypt, corporate CA) for production
+- Provider automatically trusts certificates in `vault/tls/` when co-located
 
 ### Touch Policy
 
@@ -173,18 +231,67 @@ ykman piv keys generate --touch-policy always 9d pubkey.pem
 
 ### PIN Protection
 
-- Never hardcode PIN in Terraform files
-- Use environment variable: `export YUBIKEY_PIN=123456`
-- Or use provider configuration with sensitive variable
+- Never hardcode PIN in environment variables or files
+- Use `YUBIKEY_PIN` environment variable only on trusted systems
+- Server authenticates with YubiKey once at startup, then serves secrets
 
 ### Backup Strategy
 
 ⚠️ **Critical:** If you lose your YubiKey, you lose access to secrets!
 
 **Backup options:**
-1. **Multiple YubiKeys**: Generate same key on backup YubiKey
-2. **Backup master key**: Securely store decrypted master key offline
+1. **Multiple YubiKeys**: Generate same key on backup YubiKey (if supported)
+2. **Backup master key**: Securely store decrypted `vault/master.key` offline
 3. **Re-encrypt secrets**: Keep plaintext secrets in secure vault, re-encrypt if needed
+
+## TLS Configuration
+
+YubiVault server **always uses HTTPS** to protect secrets in transit. The server uses a priority-based certificate loading system:
+
+### Certificate Priority
+
+1. **Explicit certificates** (highest priority)
+   ```bash
+   yubivault serve --cert /path/to/cert.pem --key /path/to/key.pem
+   ```
+   Use this for production deployments with Let's Encrypt or corporate certificates.
+
+2. **Convention-based certificates**
+   ```bash
+   # Place certificates in vault/tls/
+   cp my-cert.pem vault/tls/server.crt
+   cp my-key.pem vault/tls/server.key
+   yubivault serve
+   ```
+
+3. **Auto-generated self-signed certificate** (development)
+   ```bash
+   yubivault serve
+   # → Generates certificate in vault/tls/server.crt
+   # → Valid for localhost and 127.0.0.1
+   ```
+
+### Provider TLS Configuration
+
+When using self-signed certificates, the provider automatically trusts certificates from `${YUBIVAULT_PATH}/tls/server.crt` when running on the same machine as the server.
+
+For remote servers or custom certificates:
+
+```hcl
+provider "yubivault" {
+  server_url  = "https://yubivault.example.com:8099"
+  tls_ca_cert = "/path/to/ca-certificate.crt"
+}
+```
+
+For development/testing only:
+
+```hcl
+provider "yubivault" {
+  server_url           = "https://localhost:8099"
+  insecure_skip_verify = true  # ⚠️ Disables certificate verification
+}
+```
 
 ## CLI Commands
 
@@ -197,6 +304,14 @@ echo "secret" | yubivault encrypt my-secret
 
 # Decrypt secret (prints to stdout)
 yubivault decrypt my-secret
+
+# Start HTTPS server
+yubivault serve                                          # Auto-generates certificate
+yubivault serve --cert cert.pem --key key.pem          # Custom certificate
+yubivault serve 0.0.0.0:8099                           # Listen on all interfaces
+
+# Register FIDO2 credential for authentication
+yubivault fido2-register https://localhost:8099
 
 # Batch encrypt
 for secret in db_password api_key; do
@@ -245,10 +360,11 @@ go test ./internal/yubikey -v
 
 ## Limitations
 
-- **Single YubiKey dependency**: No cloud backup/recovery
-- **No secret versioning**: Rotating secrets requires re-encryption
-- **No access control**: Anyone with YubiKey + PIN can decrypt all secrets
-- **CI/CD challenges**: Requires physical YubiKey presence (or remote access solution)
+- **Single YubiKey dependency**: Vault requires physical YubiKey to start server
+- **No secret versioning**: Rotating secrets requires manual re-encryption
+- **Server-based architecture**: Terraform requires running server (not standalone provider)
+- **Self-signed certificates**: Auto-generated certificates not trusted by default outside localhost
+- **CI/CD challenges**: Server must run on machine with physical YubiKey access
 
 ## License
 
