@@ -11,17 +11,13 @@ import (
 const (
 	// SessionTokenLength is the number of random bytes in a session token
 	SessionTokenLength = 32 // 256 bits
-
-	// DefaultSessionTTL is the default session duration
-	DefaultSessionTTL = 15 * time.Minute
 )
 
 // Session represents an authenticated session
 type Session struct {
-	Token        string    `json:"token"`
-	CreatedAt    time.Time `json:"created_at"`
-	ExpiresAt    time.Time `json:"expires_at"`
-	CredentialID []byte    `json:"credential_id"`
+	Token     string    `json:"token"`
+	CreatedAt time.Time `json:"created_at"`
+	ExpiresAt time.Time `json:"expires_at"`
 }
 
 // SessionStore manages active sessions
@@ -35,29 +31,6 @@ func NewSessionStore() *SessionStore {
 	return &SessionStore{
 		sessions: make(map[string]*Session),
 	}
-}
-
-// Create generates a new session for the given credential
-func (s *SessionStore) Create(credentialID []byte) (*Session, error) {
-	tokenBytes := make([]byte, SessionTokenLength)
-	if _, err := rand.Read(tokenBytes); err != nil {
-		return nil, err
-	}
-
-	token := base64.URLEncoding.EncodeToString(tokenBytes)
-	now := time.Now()
-	session := &Session{
-		Token:        token,
-		CreatedAt:    now,
-		ExpiresAt:    now.Add(DefaultSessionTTL),
-		CredentialID: credentialID,
-	}
-
-	s.mu.Lock()
-	s.sessions[token] = session
-	s.mu.Unlock()
-
-	return session, nil
 }
 
 // Validate checks if a token is valid and returns the session
@@ -79,13 +52,6 @@ func (s *SessionStore) Validate(token string) (*Session, bool) {
 	}
 
 	return nil, false
-}
-
-// Revoke removes a session
-func (s *SessionStore) Revoke(token string) {
-	s.mu.Lock()
-	delete(s.sessions, token)
-	s.mu.Unlock()
 }
 
 // Cleanup removes all expired sessions
@@ -112,10 +78,9 @@ func (s *SessionStore) CreatePresharedToken() (string, error) {
 	token := base64.URLEncoding.EncodeToString(tokenBytes)
 	now := time.Now()
 	session := &Session{
-		Token:        token,
-		CreatedAt:    now,
-		ExpiresAt:    now.Add(100 * 365 * 24 * time.Hour), // Effectively never expires
-		CredentialID: nil,                                 // No credential association
+		Token:     token,
+		CreatedAt: now,
+		ExpiresAt: now.Add(100 * 365 * 24 * time.Hour), // Effectively never expires
 	}
 
 	s.mu.Lock()
