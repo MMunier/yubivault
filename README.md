@@ -155,6 +155,7 @@ yubivault run --project myapp plan
 - `YUBIVAULT_PATH` - Vault directory path (default: `./vault`)
 - `YUBIVAULT_SLOT` - PIV slot to use (default: `9d`)
 - `YUBIKEY_PIN` - PIV PIN for authentication
+- `YUBIVAULT_DEBUG` - Enable debug mode for detailed server logging
 
 ### PIV Slots
 
@@ -247,6 +248,10 @@ echo "secret" | yubivault encrypt my-secret
 
 # Decrypt secret (prints to stdout)
 yubivault decrypt my-secret
+
+# Encrypt/decrypt state files (for debugging)
+yubivault state-encrypt myproject < state.json
+yubivault state-decrypt myproject > state.json
 
 # Run terraform/tofu with YubiVault integration
 yubivault run init                    # Initialize Terraform

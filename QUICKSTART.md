@@ -89,12 +89,13 @@ terraform {
       version = "0.1.0"
     }
   }
+
+  # Encrypted state backend - configured automatically by yubivault run
+  backend "http" {}
 }
 
-provider "yubivault" {
-  vault_path = "./vault"
-  piv_slot   = "9d"
-}
+# Provider configured automatically via environment variables
+provider "yubivault" {}
 
 data "yubivault_secret" "db_password" {
   name = "db_password"
@@ -105,12 +106,11 @@ output "password_loaded" {
 }
 ```
 
-Run Terraform:
+Run Terraform using `yubivault run`:
 
 ```bash
-export YUBIKEY_PIN=123456
-terraform init
-terraform plan  # Touch YubiKey when prompted
+yubivault run init   # Initialize Terraform
+yubivault run plan   # Touch YubiKey once, then plan runs
 ```
 
 ## Architecture Explained
@@ -118,20 +118,21 @@ terraform plan  # Touch YubiKey when prompted
 ```
 Initialization:
 1. Generate random 256-bit AES master key
-2. Encrypt master key with YubiKey PIV public key (RSA-OAEP)
+2. Encrypt master key with YubiKey PIV public key (PKCS#1 v1.5)
 3. Save encrypted master key to vault/master.key
 
 Storing Secrets:
 1. Load encrypted master key
 2. Decrypt master key with YubiKey (requires touch)
-3. Encrypt secret with master key (AES-256-GCM)
+3. Encrypt secret with master key (AES-256-GCM with AAD)
 4. Save to vault/secrets/<name>.enc
 
-Terraform Run:
-1. Load encrypted master key (once)
-2. Decrypt with YubiKey (one touch for entire run!)
-3. Cache master key in memory
-4. Decrypt all secrets using cached master key (fast!)
+Terraform Run (yubivault run):
+1. Start HTTPS server on random port
+2. Load and decrypt master key with YubiKey (one touch!)
+3. Run terraform/tofu as subprocess with credentials
+4. Server decrypts secrets on-demand
+5. Shutdown server when terraform completes
 ```
 
 ## Troubleshooting
