@@ -31,6 +31,6 @@ init-vault: build
 	./$(BINARY_NAME) init
 
 example: install
-	cd examples/basic && terraform init && terraform plan
+	cd examples/basic && yubivault run init && yubivault run plan
 
 .DEFAULT_GOAL := build
