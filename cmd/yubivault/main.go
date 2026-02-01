@@ -6,9 +6,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
-	"syscall"
 
 	"github.com/go-piv/piv-go/v2/piv"
 	"github.com/mmunier/terraform-provider-yubivault/internal/server"
@@ -37,11 +35,6 @@ func main() {
 		}
 	case "decrypt":
 		if err := decryptSecret(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-	case "serve":
-		if err := serveStateBackend(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
@@ -77,8 +70,6 @@ func printUsage() {
 	fmt.Println("  decrypt <name>         Decrypt a secret")
 	fmt.Println("  state-encrypt <name>   Encrypt a state file (reads from stdin)")
 	fmt.Println("  state-decrypt <name>   Decrypt a state file")
-	fmt.Println("  serve [addr] [--cert cert.pem] [--key key.pem]")
-	fmt.Println("                         Start HTTPS server (default: localhost:8099)")
 	fmt.Println("  run [--project name] <terraform-args>")
 	fmt.Println("                         Run terraform/tofu with YubiVault integration")
 	fmt.Println("                         Auto-detects tofu or terraform in PATH")
@@ -265,90 +256,6 @@ func decryptSecret() error {
 	fmt.Print(string(plaintext))
 
 	return nil
-}
-
-func serveStateBackend() error {
-	vaultPath := os.Getenv("YUBIVAULT_PATH")
-	if vaultPath == "" {
-		vaultPath = "./vault"
-	}
-
-	slot := os.Getenv("YUBIVAULT_SLOT")
-	if slot == "" {
-		slot = "9d"
-	}
-
-	pin := os.Getenv("YUBIKEY_PIN")
-	if pin == "" {
-		fmt.Print("Enter PIN: ")
-		pinBytes, err := term.ReadPassword(int(os.Stdin.Fd()))
-		fmt.Println()
-		if err != nil {
-			return fmt.Errorf("failed to read PIN: %w", err)
-		}
-		pin = string(pinBytes)
-	}
-
-	// Parse arguments for address and TLS options
-	addr := "localhost:8099"
-	certFile := ""
-	keyFile := ""
-
-	for i := 2; i < len(os.Args); i++ {
-		arg := os.Args[i]
-		if arg == "--cert" && i+1 < len(os.Args) {
-			certFile = os.Args[i+1]
-			i++
-		} else if arg == "--key" && i+1 < len(os.Args) {
-			keyFile = os.Args[i+1]
-			i++
-		} else if !startsWith(arg, "--") {
-			addr = arg
-		}
-	}
-
-	// Validate TLS options - if providing custom cert, both cert and key required
-	if (certFile != "" && keyFile == "") || (certFile == "" && keyFile != "") {
-		return fmt.Errorf("both --cert and --key must be provided together for custom certificates")
-	}
-
-	// Initialize vault
-	vault, err := yubikey.NewVault(vaultPath, slot, pin)
-	if err != nil {
-		return err
-	}
-	defer vault.Close()
-
-	// Create server (no auth required for standalone serve mode)
-	srv, err := server.NewStateServer(vault, vaultPath, false)
-	if err != nil {
-		return err
-	}
-
-	// Handle shutdown signals
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	go func() {
-		<-sigChan
-		fmt.Println("\nShutting down...")
-		srv.Shutdown(ctx)
-	}()
-
-	// Start server with optional TLS
-	if err := srv.Start(addr, certFile, keyFile); err != nil && err.Error() != "http: Server closed" {
-		return err
-	}
-
-	return nil
-}
-
-// Helper function to check if a string starts with a prefix
-func startsWith(s, prefix string) bool {
-	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
 }
 
 func stateDecrypt() error {

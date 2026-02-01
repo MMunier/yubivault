@@ -212,52 +212,29 @@ ykman piv keys generate --touch-policy always 9d pubkey.pem
 
 ## TLS Configuration
 
-YubiVault server **always uses HTTPS** to protect secrets in transit. The server uses a priority-based certificate loading system:
+YubiVault **always uses HTTPS** to protect secrets in transit. The embedded server uses a priority-based certificate loading system:
 
 ### Certificate Priority
 
-1. **Explicit certificates** (highest priority)
-   ```bash
-   yubivault serve --cert /path/to/cert.pem --key /path/to/key.pem
-   ```
-   Use this for production deployments with Let's Encrypt or corporate certificates.
-
-2. **Convention-based certificates**
+1. **Convention-based certificates** (highest priority)
    ```bash
    # Place certificates in vault/tls/
    cp my-cert.pem vault/tls/server.crt
    cp my-key.pem vault/tls/server.key
-   yubivault serve
+   yubivault run plan
    ```
+   Use this for production deployments with Let's Encrypt or corporate certificates.
 
-3. **Auto-generated self-signed certificate** (development)
+2. **Auto-generated self-signed certificate** (development)
    ```bash
-   yubivault serve
-   # → Generates certificate in vault/tls/server.crt
+   yubivault run plan
+   # → Auto-generates certificate in vault/tls/server.crt
    # → Valid for localhost and 127.0.0.1
    ```
 
 ### Provider TLS Configuration
 
-When using `yubivault run`, TLS is configured automatically via environment variables (`YUBIVAULT_CA_CERT` and `TF_HTTP_CLIENT_CA_CERTIFICATE_PEM`).
-
-For standalone server usage or remote servers:
-
-```hcl
-provider "yubivault" {
-  server_url  = "https://yubivault.example.com:8099"
-  tls_ca_cert = "/path/to/ca-certificate.crt"
-}
-```
-
-For development/testing only:
-
-```hcl
-provider "yubivault" {
-  server_url           = "https://localhost:8099"
-  insecure_skip_verify = true  # Disables certificate verification
-}
-```
+When using `yubivault run`, TLS is configured automatically via environment variables (`YUBIVAULT_CA_CERT` and `TF_HTTP_CLIENT_CA_CERTIFICATE_PEM`). No manual configuration is needed.
 
 ## CLI Commands
 
@@ -271,16 +248,11 @@ echo "secret" | yubivault encrypt my-secret
 # Decrypt secret (prints to stdout)
 yubivault decrypt my-secret
 
-# Run terraform/tofu with YubiVault integration (recommended)
+# Run terraform/tofu with YubiVault integration
 yubivault run init                    # Initialize Terraform
 yubivault run plan                    # Plan changes
 yubivault run apply -auto-approve     # Apply changes
 yubivault run --project myapp plan    # Specify project name
-
-# Start standalone HTTPS server (for advanced use)
-yubivault serve                                          # Auto-generates certificate
-yubivault serve --cert cert.pem --key key.pem          # Custom certificate
-yubivault serve 0.0.0.0:8099                           # Listen on all interfaces
 
 # Batch encrypt
 for secret in db_password api_key; do

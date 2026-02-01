@@ -148,57 +148,6 @@ func (s *StateServer) setupTLS(certFile, keyFile string) (*tls.Config, string, s
 	return tlsConfig, vaultCertFile, certSource, nil
 }
 
-// Start starts the HTTPS server (always uses TLS)
-func (s *StateServer) Start(addr, certFile, keyFile string) error {
-	tlsConfig, vaultCertFile, certSource, err := s.setupTLS(certFile, keyFile)
-	if err != nil {
-		return err
-	}
-
-	// Get certificate fingerprint for logging
-	fingerprint, err := GetCertFingerprint(vaultCertFile)
-	if err != nil {
-		log.Printf("Warning: failed to get certificate fingerprint: %v", err)
-		fingerprint = "unknown"
-	}
-
-	mux := http.NewServeMux()
-
-	// Protected endpoints (auth required when configured)
-	mux.HandleFunc("/state/", s.authMw.RequireAuth(s.handleState))
-	mux.HandleFunc("/secret/", s.authMw.RequireAuth(s.handleSecret))
-
-	s.server = &http.Server{
-		Addr:         addr,
-		Handler:      s.logMiddleware(mux),
-		TLSConfig:    tlsConfig,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
-	}
-
-	vaultKeyFile := filepath.Join(s.vaultPath, "tls", "server.key.enc")
-	log.Printf("Starting YubiVault server on %s", addr)
-	log.Printf("Vault path: %s", s.vaultPath)
-	log.Printf("TLS: ENABLED (HTTPS only)")
-	log.Printf("  Certificate: %s (%s)", vaultCertFile, certSource)
-	log.Printf("  Private key: encrypted at %s", vaultKeyFile)
-	log.Printf("  Fingerprint: %s", fingerprint)
-	if certSource == "auto-generated" {
-		log.Printf("  Note: Self-signed certificate")
-	}
-	log.Printf("\nEndpoints:")
-	log.Printf("  GET  /secret/{name}   - Retrieve decrypted secret")
-	log.Printf("  *    /state/{project} - Terraform state backend")
-
-	// Start background cleanup routine
-	cleanupCtx, cleanupCancel := context.WithCancel(context.Background())
-	s.cleanupCancel = cleanupCancel
-	s.startCleanupRoutine(cleanupCtx)
-
-	// Start HTTPS server (cert/key already loaded in TLSConfig)
-	return s.server.ListenAndServeTLS("", "")
-}
-
 // StartWithListener starts the HTTPS server using a pre-created listener.
 // This allows the caller to bind to a random port and know the address before starting.
 // The ready channel is closed when the server is ready to accept connections.
