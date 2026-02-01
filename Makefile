@@ -18,6 +18,11 @@ install: build
 test:
 	go test -v ./...
 
+integration_test:
+	@echo YUBIKEY_PIN: ; \
+	read -s YUBIKEY_PIN ; \
+	YUBIKEY_PIN=$$YUBIKEY_PIN go test -tags=integration -v ./...
+
 clean:
 	rm -f $(BINARY_NAME) $(PROVIDER_NAME)
 	rm -rf vault/
