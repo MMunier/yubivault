@@ -200,8 +200,8 @@ func NewVault(vaultPath, slotStr, pin string) (*Vault, error) {
 		privateKey: privateKey,
 	}
 
-	// Load or generate master key
-	if err := vault.loadOrGenerateMasterKey(); err != nil {
+	// Load master key (must be initialized via 'yubivault init' first)
+	if err := vault.loadMasterKey(); err != nil {
 		yk.Close()
 		return nil, err
 	}
@@ -223,28 +223,26 @@ func (v *Vault) Close() error {
 	return nil
 }
 
-// loadOrGenerateMasterKey loads existing master key or generates a new one
-func (v *Vault) loadOrGenerateMasterKey() error {
+// loadMasterKey loads and decrypts the master key from disk.
+// The vault must be initialized first via 'yubivault init'.
+func (v *Vault) loadMasterKey() error {
 	masterKeyPath := filepath.Join(v.vaultPath, "master.key")
 
-	// Try to load existing master key
 	encryptedMasterKey, err := os.ReadFile(masterKeyPath)
-	if err == nil {
-		// Decrypt master key using YubiKey
-		masterKey, err := v.decryptWithYubiKey(encryptedMasterKey)
-		if err != nil {
-			return fmt.Errorf("failed to decrypt master key: %w", err)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("master key not found at %s - use 'yubivault init' to initialize vault", masterKeyPath)
 		}
-		v.masterKey = masterKey
-		return nil
-	}
-
-	// Generate new master key if it doesn't exist
-	if !os.IsNotExist(err) {
 		return fmt.Errorf("failed to read master key: %w", err)
 	}
 
-	return fmt.Errorf("master key not found at %s - use 'yubivault init' to initialize vault", masterKeyPath)
+	// Decrypt master key using YubiKey
+	masterKey, err := v.decryptWithYubiKey(encryptedMasterKey)
+	if err != nil {
+		return fmt.Errorf("failed to decrypt master key: %w", err)
+	}
+	v.masterKey = masterKey
+	return nil
 }
 
 // decryptWithYubiKey decrypts data using YubiKey PIV private key
