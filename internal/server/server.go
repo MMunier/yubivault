@@ -178,19 +178,22 @@ func (s *StateServer) StartWithListener(listener net.Listener, certFile, keyFile
 	}
 	s.listener = listener
 
-	vaultKeyFile := filepath.Join(s.vaultPath, "tls", "server.key.enc")
-	log.Printf("Starting YubiVault server on %s", listener.Addr().String())
-	log.Printf("Vault path: %s", s.vaultPath)
-	log.Printf("TLS: ENABLED (HTTPS only)")
-	log.Printf("  Certificate: %s (%s)", vaultCertFile, certSource)
-	log.Printf("  Private key: encrypted at %s", vaultKeyFile)
-	log.Printf("  Fingerprint: %s", fingerprint)
-	if certSource == "auto-generated" {
-		log.Printf("  Note: Self-signed certificate")
+	// Log detailed TLS info when debug mode is enabled
+	if os.Getenv("YUBIVAULT_DEBUG") != "" {
+		vaultKeyFile := filepath.Join(s.vaultPath, "tls", "server.key.enc")
+		log.Printf("Vault path: %s", s.vaultPath)
+		log.Printf("TLS: ENABLED (HTTPS only)")
+		log.Printf("  Certificate: %s (%s)", vaultCertFile, certSource)
+		log.Printf("  Private key: encrypted at %s", vaultKeyFile)
+		log.Printf("  Fingerprint: %s", fingerprint)
+		if certSource == "auto-generated" {
+			log.Printf("  Note: Self-signed certificate")
+		}
+		log.Printf("")
+		log.Printf("Endpoints:")
+		log.Printf("  GET  /secret/{name}   - Retrieve decrypted secret")
+		log.Printf("  *    /state/{project} - Terraform state backend")
 	}
-	log.Printf("\nEndpoints:")
-	log.Printf("  GET  /secret/{name}   - Retrieve decrypted secret")
-	log.Printf("  *    /state/{project} - Terraform state backend")
 
 	// Start background cleanup routine
 	cleanupCtx, cleanupCancel := context.WithCancel(context.Background())
